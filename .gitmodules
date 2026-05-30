@@ -1,0 +1,4 @@
+[submodule "external/engine"]
+	path = external/engine
+	url = https://github.com/hypochoco/engine.git
+
