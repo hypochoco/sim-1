@@ -1,0 +1,19 @@
+[project]
+name = "sim1"
+version = "0.0.1"
+description = "Training layer over the differentiable humanoid physics engine (P0 scaffolding)."
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.0", "torch>=2.2", "tensorboard>=2.14", "tqdm>=4.66"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sim1*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

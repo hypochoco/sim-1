@@ -1,0 +1,121 @@
+"""Config schema — plain dataclasses with in-code defaults.
+
+The full config *framework* (Hydra/YAML compose + sweeps) is intentionally deferred. For now a
+run is described by these dataclasses; they are serialized into the run dir (`config.json`) for
+reproducibility, and a light dotted-override mechanism (`ppo.lr=1e-3`) supports quick iteration.
+Fields for the real engine (substeps/kp/kd/...) already live in `EnvConfig` so configs stay
+forward-compatible when the binding lands.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass
+class EnvConfig:
+    kind: str = "mock"              # "mock" (P0) | "engine" (P1, when the binding lands)
+    num_envs: int = 64
+    episode_len: int = 64           # control steps per episode (time-limit truncation)
+
+    # --- mock-only dynamics params ---
+    ndof: int = 2
+    dt: float = 0.05
+    damping: float = 0.1
+    action_scale: float = 1.0
+    target_scale: float = 1.0
+
+    # --- engine params (unused in P0; kept for forward-compat / sim tuning in P1) ---
+    substeps: int = 8
+    control_dt: float = 1.0 / 60.0
+    kp: float = 150.0
+    kd: float = 15.0
+    max_torque: float = 150.0
+    action_mode: str = "torque"     # "torque" | "pd_target"
+    ground_friction: float = 0.9
+
+
+@dataclass
+class TaskConfig:
+    name: str = "reach"             # P0 mock task
+    pos_weight: float = 1.0
+    vel_weight: float = 0.0
+    action_weight: float = 0.01
+
+
+@dataclass
+class PPOConfig:
+    total_steps: int = 300_000
+    rollout_len: int = 32
+    lr: float = 3e-4
+    anneal_lr: bool = True
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_coef: float = 0.2
+    update_epochs: int = 4
+    num_minibatches: int = 4
+    ent_coef: float = 0.0
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    clip_vloss: bool = True
+    norm_adv: bool = True
+    norm_obs: bool = True
+    norm_reward: bool = True        # normalize rewards by the running std of the discounted return
+    reward_clip: float = 10.0       # clip normalized rewards to +/- this (0 disables)
+    hidden_sizes: tuple[int, ...] = (128, 128)
+
+
+@dataclass
+class RunConfig:
+    name: str = "ppo_mock"
+    seed: int = 0
+    device: str = "cpu"             # "cpu" | "cuda" | "mps"
+    runs_root: str = "runs"
+    checkpoint_interval: int = 20   # iterations between checkpoints
+    keep_last: int = 3              # rolling checkpoints to retain (plus best + final)
+
+
+@dataclass
+class TrainConfig:
+    env: EnvConfig = field(default_factory=EnvConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+    run: RunConfig = field(default_factory=RunConfig)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "TrainConfig":
+        return TrainConfig(
+            env=EnvConfig(**d.get("env", {})),
+            task=TaskConfig(**d.get("task", {})),
+            ppo=PPOConfig(**d.get("ppo", {})),
+            run=RunConfig(**d.get("run", {})),
+        )
+
+    def apply_overrides(self, overrides: list[str]) -> None:
+        """Apply dotted `section.field=value` overrides, coercing to the field's type."""
+        for ov in overrides:
+            key, sep, val = ov.partition("=")
+            if not sep:
+                raise ValueError(f"bad override (expected section.field=value): {ov!r}")
+            section_name, _, field_name = key.partition(".")
+            if not field_name:
+                raise ValueError(f"bad override key (expected section.field): {key!r}")
+            section = getattr(self, section_name, None)
+            if section is None or not hasattr(section, field_name):
+                raise ValueError(f"unknown config field: {key!r}")
+            cur = getattr(section, field_name)
+            setattr(section, field_name, _coerce(cur, val))
+
+
+def _coerce(cur: Any, val: str) -> Any:
+    if isinstance(cur, bool):
+        return val.lower() in ("1", "true", "yes", "on")
+    if isinstance(cur, int):
+        return int(val)
+    if isinstance(cur, float):
+        return float(val)
+    return val

@@ -1,3 +1,13 @@
 .DS_Store
 .vscode/
 build/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# training outputs
+runs/

@@ -1,0 +1,6 @@
+# sim-1 training layer (P0). The C++ engine + its Python binding are built separately.
+numpy>=2.0
+torch>=2.2
+tensorboard>=2.14
+tqdm>=4.66
+pytest>=8.0
