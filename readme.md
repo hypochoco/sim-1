@@ -5,6 +5,11 @@ The **training layer** over the differentiable humanoid physics engine
 (observation composition, reward, termination), the RL algorithms, and the training
 infrastructure.
 
+> **Taking over the training?** Read **[`HANDOFF.md`](HANDOFF.md)** first — it has the full
+> operational context: current state + verified results, run commands, the config surface, the
+> gotchas (PD-target vs torque, substeps, divergence guard, CPU-bound sim), the file map, the
+> prioritized next steps, and the exact git state.
+
 ## Status: P1 — training on the real engine
 
 The engine's Python binding (`csrc/ → sim1.engine_py`, nanobind) is wired and builds **headless**
