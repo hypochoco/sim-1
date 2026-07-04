@@ -1,19 +1,24 @@
 [project]
 name = "sim1"
 version = "0.0.1"
-description = "Training layer over the differentiable humanoid physics engine (P0 scaffolding)."
+description = "Training layer over the differentiable humanoid physics engine."
 requires-python = ">=3.10"
 dependencies = ["numpy>=2.0", "torch>=2.2", "tensorboard>=2.14", "tqdm>=4.66"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
+# scikit-build-core drives CMake to build the `engine_py` nanobind extension against the engine.
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
 
-[tool.setuptools.packages.find]
-include = ["sim1*"]
+[tool.scikit-build]
+# Build only the binding target; ship it inside the sim1 package alongside the pure-Python code.
+build.targets = ["engine_py"]
+wheel.packages = ["sim1"]
+cmake.version = ">=3.15"
+cmake.build-type = "Release"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

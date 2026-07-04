@@ -33,16 +33,26 @@ class TaskEnv:
         return self.task.observe(self.env)
 
     def step(self, actions: np.ndarray):
-        self.env.actions[:] = actions
+        self.env.actions[:] = actions * self.task.action_scale
         self.env.step()
         self._ep_step += 1
 
         reward = self.task.reward(self.env, actions)
         fail = self.task.done(self.env, self._ep_step)
         truncated = self._ep_step >= self.episode_len
-        done = np.logical_or(fail, truncated)
 
         terminal_obs = self.task.observe(self.env)  # obs at terminal state (before reset)
+
+        # Divergence guard: a physics blow-up (non-finite obs/reward) is treated as a failed
+        # episode — sanitize the values and force-reset that env, so one bad world can't NaN-poison
+        # the whole batch or the policy update.
+        nonfinite = ~np.isfinite(terminal_obs).all(axis=1)
+        if nonfinite.any():
+            fail = fail | nonfinite
+            terminal_obs = np.nan_to_num(terminal_obs, nan=0.0, posinf=0.0, neginf=0.0)
+        reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+        done = np.logical_or(fail, truncated)
         info = {"terminal_obs": terminal_obs, "truncated": truncated.copy(), "fail": fail.copy()}
 
         obs = terminal_obs

@@ -24,6 +24,7 @@ class ReachTask:
         self.ndof = int(ndof)
         self.act_dim = int(ndof)
         self.obs_dim = 2 * int(ndof)  # (q - target) ++ qd
+        self.action_scale = 1.0       # mock env applies its own scaling internally
         self.pos_weight = float(pos_weight)
         self.vel_weight = float(vel_weight)
         self.action_weight = float(action_weight)

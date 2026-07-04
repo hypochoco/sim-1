@@ -18,6 +18,7 @@ from sim1.envs.vecenv import VecEnv
 class Task(Protocol):
     obs_dim: int
     act_dim: int
+    action_scale: float   # policy output is multiplied by this before being written as the env action
 
     def reset(self, env: VecEnv, seed: int) -> None:
         """Sample per-env task parameters (e.g. targets) for all envs."""

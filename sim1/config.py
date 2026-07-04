@@ -27,6 +27,9 @@ class EnvConfig:
     target_scale: float = 1.0
 
     # --- engine params (unused in P0; kept for forward-compat / sim tuning in P1) ---
+    model: str = "humanoid"         # "humanoid" (21 DOF) | "amp" (28 DOF) — the engine rig
+    backend: str = "reduced"        # "reduced" (Featherstone) | "realtime" (maximal)
+    threads: int = 0                # VecEnv worker threads (0 = hardware concurrency)
     substeps: int = 8
     control_dt: float = 1.0 / 60.0
     kp: float = 150.0
@@ -38,10 +41,18 @@ class EnvConfig:
 
 @dataclass
 class TaskConfig:
-    name: str = "reach"             # P0 mock task
+    name: str = "reach"             # "reach" (mock) | "stand" (humanoid)
+    # reach (mock)
     pos_weight: float = 1.0
     vel_weight: float = 0.0
     action_weight: float = 0.01
+    # stand (humanoid)
+    upright_weight: float = 1.0     # reward for the torso staying vertical
+    height_weight: float = 1.0      # reward for the root staying near its standing height
+    alive_bonus: float = 1.0        # per-step reward for not having fallen
+    fall_height_frac: float = 0.5   # terminate when root height < frac * standing height
+    upright_fall: float = 0.3       # terminate when uprightness (world up · torso up) < this
+    pd_action_scale: float = 1.0    # PD-target mode: policy output → target (radians / rotvec)
 
 
 @dataclass

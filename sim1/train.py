@@ -21,9 +21,10 @@ from tqdm import tqdm
 
 from sim1.algos.ppo import PPOTrainer
 from sim1.config import TrainConfig
-from sim1.envs.mock_vecenv import MockVecEnv
+from sim1.envs.engine_vecenv import make_vecenv
 from sim1.envs.task_env import TaskEnv
 from sim1.tasks.reach import ReachTask
+from sim1.tasks.stand import StandTask
 from sim1.utils.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sim1.utils.logging import MetricLogger
 from sim1.utils.run_dir import create_run_dir
@@ -38,26 +39,37 @@ def resolve_device(name: str) -> str:
     return "cpu"
 
 
-def build_env(cfg: TrainConfig) -> TaskEnv:
-    if cfg.env.kind != "mock":
-        raise NotImplementedError(
-            f"env kind {cfg.env.kind!r} not available yet — the engine binding lands in P1"
+def build_task(cfg: TrainConfig, vecenv):
+    name = cfg.task.name
+    if name == "reach":
+        return ReachTask(
+            ndof=vecenv.act_dim,
+            pos_weight=cfg.task.pos_weight,
+            vel_weight=cfg.task.vel_weight,
+            action_weight=cfg.task.action_weight,
+            target_scale=cfg.env.target_scale,
         )
-    vecenv = MockVecEnv(
-        num_envs=cfg.env.num_envs,
-        ndof=cfg.env.ndof,
-        dt=cfg.env.dt,
-        damping=cfg.env.damping,
-        action_scale=cfg.env.action_scale,
-        seed=cfg.run.seed,
-    )
-    task = ReachTask(
-        ndof=cfg.env.ndof,
-        pos_weight=cfg.task.pos_weight,
-        vel_weight=cfg.task.vel_weight,
-        action_weight=cfg.task.action_weight,
-        target_scale=cfg.env.target_scale,
-    )
+    if name == "stand":
+        # torque mode: map unit policy output onto the torque range; PD-target mode: onto radians.
+        action_scale = cfg.env.max_torque if cfg.env.action_mode == "torque" else cfg.task.pd_action_scale
+        return StandTask(
+            ndof=vecenv.ndof,
+            nbody=vecenv.nbody,
+            act_dim=vecenv.act_dim,
+            action_scale=action_scale,
+            upright_weight=cfg.task.upright_weight,
+            height_weight=cfg.task.height_weight,
+            alive_bonus=cfg.task.alive_bonus,
+            action_weight=cfg.task.action_weight,
+            fall_height_frac=cfg.task.fall_height_frac,
+            upright_fall=cfg.task.upright_fall,
+        )
+    raise ValueError(f"unknown task {name!r} (expected 'reach' or 'stand')")
+
+
+def build_env(cfg: TrainConfig) -> TaskEnv:
+    vecenv = make_vecenv(cfg.env, seed=cfg.run.seed)
+    task = build_task(cfg, vecenv)
     return TaskEnv(vecenv, task, episode_len=cfg.env.episode_len, seed=cfg.run.seed)
 
 
