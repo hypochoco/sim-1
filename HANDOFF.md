@@ -123,6 +123,14 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
   planar velocity); the trained policy is user-steerable via `task.set_goal(...)`. Warm-start any of
   these from a prior policy with `--init-from <ckpt>` (shape-tolerant: shared proprio trunk transfers;
   mismatched I/O layers re-init).
+- **`task.rotation`** (`quat` | `sixd`): root-orientation obs encoding. `sixd` is the continuous 6D
+  representation (Zhou et al. — first two rotation-matrix columns; nets learn rotations better than
+  from quats). It **changes obs_dim** (+2), so a `sixd` policy is a *fresh lineage* — it does NOT
+  transfer from `quat`-trained weights (and vice versa). Reward/termination are unaffected (they read
+  the raw quat). Caveats: (a) only the *root* orientation is 6D today — per-body 6D
+  (SuperTrack-style) is the tracking-layer follow-up. The visual runner **does** handle `sixd`: the
+  policy file (V3) carries a `rotation` field and `amp_policy.cpp` mirrors the quat→6D conversion
+  (`tst::quatTo6D`, matching `proprio.quat_to_6d`) when composing the obs.
 - **`ppo`**: `total_steps`, `rollout_len`, `lr`, `anneal_lr`, `gamma`, `gae_lambda`, `clip_coef`,
   `update_epochs`, `num_minibatches`, `ent_coef`, `vf_coef`, `max_grad_norm`, `clip_vloss`,
   `norm_adv`, `norm_obs`, `norm_reward`, `reward_clip`, `hidden_sizes`.

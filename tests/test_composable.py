@@ -105,3 +105,35 @@ def test_set_goal_for_user_control():
     t.reset(env, 0)
     t.set_goal(np.tile(np.array([1.0, 0.0], dtype=np.float32), (env.num_envs, 1)))
     assert np.array_equal(t.observe(env)[:, -2:], np.tile([1.0, 0.0], (env.num_envs, 1)))
+
+
+def test_quat_to_6d_identity_and_orthonormality():
+    from sim1.tasks.proprio import quat_to_6d
+    # identity quaternion → first two rotation-matrix columns = e0, e1
+    ident = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    six = quat_to_6d(ident)
+    assert np.allclose(six, [[1, 0, 0, 0, 1, 0]], atol=1e-6)
+    # random unit quats → the two 3-vectors are unit-length and orthogonal (valid rotation columns)
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal((16, 4)).astype(np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    six = quat_to_6d(q)
+    c0, c1 = six[:, :3], six[:, 3:]
+    assert np.allclose(np.linalg.norm(c0, axis=1), 1, atol=1e-5)
+    assert np.allclose(np.linalg.norm(c1, axis=1), 1, atol=1e-5)
+    assert np.allclose(np.sum(c0 * c1, axis=1), 0, atol=1e-5)
+
+
+def test_sixd_changes_obs_dim_not_reward():
+    from sim1.tasks.proprio import proprio_dim
+    env = _env()
+    q = StandTask(ndof=env.ndof, nbody=1, act_dim=env.act_dim, action_scale=1.0, rot_repr="quat")
+    s = StandTask(ndof=env.ndof, nbody=1, act_dim=env.act_dim, action_scale=1.0, rot_repr="sixd")
+    q.reset(env, 0); s.reset(env, 0)
+    env.step()
+    assert q.obs_dim == proprio_dim(env.ndof, 1, "quat")
+    assert s.obs_dim == proprio_dim(env.ndof, 1, "sixd") == q.obs_dim + 2   # 6D adds 2 channels
+    assert s.observe(env).shape == (env.num_envs, s.obs_dim)
+    # 6D changes only the observation representation, never the reward/termination
+    a = np.zeros((env.num_envs, env.act_dim), dtype=np.float32)
+    assert np.allclose(q.reward(env, a), s.reward(env, a))

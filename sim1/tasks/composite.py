@@ -49,11 +49,13 @@ class CompositeTask:
         terminate_fn: Callable = never_terminate,
         command_weight: float = 1.0,
         extra_obs: Sequence[ObsComponent] = (),
+        rot_repr: str = "quat",
     ):
         self.ndof = int(ndof)
         self.nbody = int(nbody)
         self.act_dim = int(act_dim)
         self.action_scale = float(action_scale)
+        self.rot_repr = rot_repr   # root-orientation obs encoding: "quat" | "sixd"
 
         self.command: Command = command if command is not None else NoCommand()
         self.reward_terms = list(reward_terms)
@@ -61,7 +63,7 @@ class CompositeTask:
         self.command_weight = float(command_weight)
         self.extra_obs = list(extra_obs)
 
-        self.obs_dim = proprio_dim(ndof, nbody) + self.command.dim + sum(c.dim for c in self.extra_obs)
+        self.obs_dim = proprio_dim(ndof, nbody, rot_repr) + self.command.dim + sum(c.dim for c in self.extra_obs)
         self._target_h: np.ndarray | None = None   # authored standing height, captured at reset
         self._goals: np.ndarray | None = None       # per-env command goal
         self.reward_info: dict[str, float] = {}      # last per-term reward means (for logging/debug)
@@ -81,7 +83,7 @@ class CompositeTask:
             self._goals[m] = self.command.sample(int(m.sum()), np.random.default_rng(seed))
 
     def observe(self, env: VecEnv) -> np.ndarray:
-        parts = [proprio_obs(env)]
+        parts = [proprio_obs(env, self.rot_repr)]
         if self.command.dim:
             parts.append(self.command.to_obs(env, self._goals))
         for c in self.extra_obs:

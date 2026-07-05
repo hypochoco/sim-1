@@ -16,17 +16,36 @@ import numpy as np
 from sim1.envs.vecenv import VecEnv
 
 
-def proprio_dim(ndof: int, nbody: int) -> int:
-    return 1 + 4 + 3 + 3 + 2 * int(ndof) + int(nbody)
+def _rot_dim(rot: str) -> int:
+    return 6 if rot == "sixd" else 4
 
 
-def proprio_obs(env: VecEnv) -> np.ndarray:
+def quat_to_6d(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Quaternion (w, x, y, z) → the continuous 6D rotation representation (Zhou et al. 2019): the
+    first two columns of the rotation matrix, shape (n, 6). Continuous over SO(3) (no double-cover /
+    gimbal discontinuity), so nets learn rotation-dependent functions better than from quats/Euler.
+    Reconstruct a rotation by Gram-Schmidt on the two 3-vectors."""
+    w, x, y, z = quat_wxyz[:, 0], quat_wxyz[:, 1], quat_wxyz[:, 2], quat_wxyz[:, 3]
+    # columns 0 and 1 of R(q)
+    c0 = np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], axis=1)
+    c1 = np.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], axis=1)
+    return np.concatenate([c0, c1], axis=1).astype(np.float32)
+
+
+def proprio_dim(ndof: int, nbody: int, rot: str = "quat") -> int:
+    return 1 + _rot_dim(rot) + 3 + 3 + 2 * int(ndof) + int(nbody)
+
+
+def proprio_obs(env: VecEnv, rot: str = "quat") -> np.ndarray:
     """The canonical body-state block, shape (num_envs, proprio_dim). Translation-invariant (drops
-    root x,z; keeps height)."""
+    root x,z; keeps height). `rot` selects the root-orientation encoding: `quat` (w,x,y,z) or the
+    continuous `sixd` (6D)."""
+    q = env.root_pose[:, 3:7]
+    rot_feat = quat_to_6d(q) if rot == "sixd" else q
     return np.concatenate(
         [
             env.root_pose[:, 1:2],   # height
-            env.root_pose[:, 3:7],   # quat (w, x, y, z)
+            rot_feat,                # root orientation (quat 4 | 6D 6)
             env.root_twist[:, 0:3],  # linear velocity
             env.root_twist[:, 3:6],  # angular velocity
             env.joint_q,

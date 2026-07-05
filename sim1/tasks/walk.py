@@ -43,6 +43,7 @@ class WalkTask(CompositeTask):
         command_weight: float = 1.0,
         fall_height_frac: float = 0.5,
         upright_fall: float = 0.3,
+        rot_repr: str = "quat",
     ):
         super().__init__(
             ndof,
@@ -58,4 +59,5 @@ class WalkTask(CompositeTask):
             ],
             terminate_fn=fall_termination(fall_height_frac, upright_fall),
             command_weight=command_weight,
+            rot_repr=rot_repr,
         )
