@@ -44,6 +44,17 @@ def term_ctrl_penalty(env: VecEnv, actions: np.ndarray, task) -> np.ndarray:
     return np.mean(actions ** 2, axis=1).astype(np.float32)
 
 
+def position_keep_term(scale: float = 1.0) -> TermFn:
+    """Factory: `exp(-scale · ‖root_xz − start_xz‖²)` — 1.0 at the start position, decaying with
+    horizontal drift. Rewards holding a spot (stand/getup); needs `task._start_xz` (captured at
+    reset). Not for locomotion tasks (walk *should* move)."""
+    def fn(env: VecEnv, actions: np.ndarray, task) -> np.ndarray:
+        xz = np.stack([env.root_pose[:, 0], env.root_pose[:, 2]], axis=1)
+        d2 = np.sum((xz - task._start_xz) ** 2, axis=1)
+        return np.exp(-scale * d2).astype(np.float32)
+    return fn
+
+
 # --- termination factories: fn(env, task) -> bool (num_envs,) ---
 def fall_termination(fall_height_frac: float, upright_fall: float) -> Callable:
     def fn(env: VecEnv, task) -> np.ndarray:

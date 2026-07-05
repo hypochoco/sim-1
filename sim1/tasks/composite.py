@@ -65,12 +65,14 @@ class CompositeTask:
 
         self.obs_dim = proprio_dim(ndof, nbody, rot_repr) + self.command.dim + sum(c.dim for c in self.extra_obs)
         self._target_h: np.ndarray | None = None   # authored standing height, captured at reset
-        self._goals: np.ndarray | None = None       # per-env command goal
+        self._start_xz: np.ndarray | None = None    # start (x, z) position, captured at reset
+        self._goals: np.ndarray | None = None        # per-env command goal
         self.reward_info: dict[str, float] = {}      # last per-term reward means (for logging/debug)
 
     # --- Task protocol ---
     def reset(self, env: VecEnv, seed: int) -> None:
         self._target_h = env.root_pose[:, 1].copy()
+        self._start_xz = env.root_pose[:, [0, 2]].copy()
         n = env.root_pose.shape[0]
         self._goals = self.command.sample(n, np.random.default_rng(seed))
 
@@ -81,6 +83,7 @@ class CompositeTask:
         m = np.asarray(mask, dtype=bool)
         if m.any():
             self._goals[m] = self.command.sample(int(m.sum()), np.random.default_rng(seed))
+            self._start_xz[m] = env.root_pose[m][:, [0, 2]]   # re-anchor reset envs to their new spot
 
     def observe(self, env: VecEnv) -> np.ndarray:
         parts = [proprio_obs(env, self.rot_repr)]

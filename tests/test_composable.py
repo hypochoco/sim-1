@@ -107,6 +107,28 @@ def test_set_goal_for_user_control():
     assert np.array_equal(t.observe(env)[:, -2:], np.tile([1.0, 0.0], (env.num_envs, 1)))
 
 
+def test_position_keeping_penalizes_drift():
+    from sim1.tasks.rewards import position_keep_term
+
+    class FakeEnv:
+        def __init__(self, xz):
+            n = xz.shape[0]
+            self.root_pose = np.zeros((n, 7), dtype=np.float32)
+            self.root_pose[:, 3] = 1.0
+            self.root_pose[:, 0] = xz[:, 0]
+            self.root_pose[:, 2] = xz[:, 1]
+
+    class T:
+        _start_xz = np.zeros((2, 2), dtype=np.float32)
+
+    fn = position_keep_term(scale=1.0)
+    e = FakeEnv(np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32))
+    r = fn(e, np.zeros((2, 28), dtype=np.float32), T())
+    assert r[0] == 1.0                         # at start → full reward
+    assert np.isclose(r[1], np.exp(-1.0))      # drift of 1 m → exp(-1); monotonically penalized
+    assert r[1] < r[0]
+
+
 def test_quat_to_6d_identity_and_orthonormality():
     from sim1.tasks.proprio import quat_to_6d
     # identity quaternion → first two rotation-matrix columns = e0, e1

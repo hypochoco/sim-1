@@ -53,6 +53,8 @@ class TaskConfig:
     fall_height_frac: float = 0.5   # terminate when root height < frac * standing height
     upright_fall: float = 0.3       # terminate when uprightness (world up · torso up) < this
     pd_action_scale: float = 1.0    # PD-target mode: policy output → target (radians / rotvec)
+    position_weight: float = 0.0    # reward for staying near the start (x,z) — stand/getup; 0 = off
+    position_scale: float = 1.0     # sharpness of the position-keeping Gaussian
     rotation: str = "quat"          # root-orientation obs encoding: "quat" (4) | "sixd" (continuous 6D)
     # walk (goal-conditioned locomotion)
     command_weight: float = 1.0     # reward weight on tracking the commanded velocity

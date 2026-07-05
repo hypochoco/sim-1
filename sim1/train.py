@@ -66,6 +66,8 @@ def build_task(cfg: TrainConfig, vecenv):
             action_weight=cfg.task.action_weight,
             fall_height_frac=cfg.task.fall_height_frac,
             upright_fall=cfg.task.upright_fall,
+            position_weight=cfg.task.position_weight,
+            position_scale=cfg.task.position_scale,
             rot_repr=cfg.task.rotation,
         )
     if name == "walk":

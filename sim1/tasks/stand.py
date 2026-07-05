@@ -16,6 +16,7 @@ from sim1.tasks.composite import CompositeTask
 from sim1.tasks.rewards import (
     RewardTerm,
     fall_termination,
+    position_keep_term,
     term_alive,
     term_ctrl_penalty,
     term_height,
@@ -36,6 +37,8 @@ class StandTask(CompositeTask):
         action_weight: float = 0.01,
         fall_height_frac: float = 0.5,
         upright_fall: float = 0.3,
+        position_weight: float = 0.0,
+        position_scale: float = 1.0,
         rot_repr: str = "quat",
     ):
         super().__init__(
@@ -49,6 +52,7 @@ class StandTask(CompositeTask):
                 RewardTerm("upright", upright_weight, term_upright),
                 RewardTerm("height", height_weight, term_height),
                 RewardTerm("ctrl", -action_weight, term_ctrl_penalty),
+                RewardTerm("position", position_weight, position_keep_term(position_scale)),
             ],
             terminate_fn=fall_termination(fall_height_frac, upright_fall),
             command_weight=0.0,

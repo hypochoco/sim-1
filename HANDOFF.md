@@ -38,6 +38,14 @@ python -m sim1.train --name stand_amp \
   -o env.num_envs=64 -o env.episode_len=300 -o env.substeps=48 \
   -o env.action_mode=pd_target -o task.name=stand -o ppo.total_steps=2000000
 
+# HUMANOID getup (stand + recover; warm-started from a stand policy, position-keeping ON to curb drift)
+python -m sim1.train --name getup_amp \
+  --init-from runs/<stand_run>/checkpoints/best.pt \
+  -o env.kind=engine -o env.model=amp -o env.backend=reduced \
+  -o env.num_envs=64 -o env.episode_len=1000 -o env.substeps=48 \
+  -o env.action_mode=pd_target -o task.name=getup -o task.rotation=quat \
+  -o task.height_weight=2.0 -o task.position_weight=0.5 -o ppo.total_steps=8000000
+
 python -m sim1.train --resume runs/<run_id>     # resume (fully restores model/opt/rms/rng/step)
 python -m sim1.eval  --run runs/<run_id>        # deterministic (mean-action) rollout
 tensorboard --logdir runs                       # live curves
@@ -123,6 +131,13 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
   planar velocity); the trained policy is user-steerable via `task.set_goal(...)`. Warm-start any of
   these from a prior policy with `--init-from <ckpt>` (shape-tolerant: shared proprio trunk transfers;
   mismatched I/O layers re-init).
+- **`task.position_weight`** / **`task.position_scale`** (stand/getup): reward for staying near the
+  start `(x,z)` — `exp(-scale·‖xz−xz₀‖²)`. Default `0` (off, so it doesn't change the banked stand's
+  behavior); set `position_weight≈0.5` to curb the horizontal drift seen in the first stand. Not for
+  `walk` (it's meant to move). **getup caveat:** without an engine RSI/knockdown hook, `getup` only
+  learns to recover from *self-induced* falls (long episode + no fall-termination); deliberate
+  knockdowns / reset-from-fallen need a small engine addition (expose `Environment::setResetHook` /
+  an initial-state randomizer / an impulse call) — future work.
 - **`task.rotation`** (`quat` | `sixd`): root-orientation obs encoding. `sixd` is the continuous 6D
   representation (Zhou et al. — first two rotation-matrix columns; nets learn rotations better than
   from quats). It **changes obs_dim** (+2), so a `sixd` policy is a *fresh lineage* — it does NOT
