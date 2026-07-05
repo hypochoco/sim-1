@@ -69,6 +69,8 @@ def build_task(cfg: TrainConfig, vecenv):
             position_weight=cfg.task.position_weight,
             position_scale=cfg.task.position_scale,
             rot_repr=cfg.task.rotation,
+            frame=cfg.task.frame,
+            body_obs=cfg.task.body_obs,
         )
     if name == "walk":
         action_scale = cfg.env.max_torque if cfg.env.action_mode == "torque" else cfg.task.pd_action_scale
@@ -86,6 +88,8 @@ def build_task(cfg: TrainConfig, vecenv):
             fall_height_frac=cfg.task.fall_height_frac,
             upright_fall=cfg.task.upright_fall,
             rot_repr=cfg.task.rotation,
+            frame=cfg.task.frame,
+            body_obs=cfg.task.body_obs,
         )
     raise ValueError(f"unknown task {name!r} (expected 'reach', 'stand', 'getup', or 'walk')")
 

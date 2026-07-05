@@ -21,7 +21,7 @@ from typing import Protocol, Sequence
 import numpy as np
 
 from sim1.envs.vecenv import VecEnv
-from sim1.tasks.proprio import planar_velocity, root_yaw
+from sim1.tasks.proprio import planar_velocity, rotate_to_heading, root_yaw
 
 
 class Command(Protocol):
@@ -76,12 +76,10 @@ class HeadingSpeedCommand:
     def to_obs(self, env: VecEnv, goal: np.ndarray) -> np.ndarray:
         if self.frame == "world":
             return goal.astype(np.float32)
-        # rotate the world target (vx, vz) by -yaw into the character's heading frame
+        # express the world target (vx, vz) in the character's heading frame (shared convention)
         yaw = root_yaw(env)
-        c, s = np.cos(-yaw), np.sin(-yaw)
-        vx, vz = goal[:, 0], goal[:, 1]
-        local = np.stack([c * vx - s * vz, s * vx + c * vz], axis=1)
-        return local.astype(np.float32)
+        lx, lz = rotate_to_heading(goal[:, 0], goal[:, 1], yaw)
+        return np.stack([lx, lz], axis=1).astype(np.float32)
 
     def reward(self, env: VecEnv, goal: np.ndarray) -> np.ndarray:
         err = np.sum((planar_velocity(env) - goal) ** 2, axis=1)

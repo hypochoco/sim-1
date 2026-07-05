@@ -100,22 +100,39 @@ proof (reward can be gamed). Tune the `_SURVIVAL_OK`/`_UPRIGHT_OK` thresholds in
 **Visual (3D) playback is NOT available in the headless training build** (no renderer — that's the
 whole point of `ENGINE_TRAINING_ONLY`). To *watch* a trained policy: `python -m sim1.export_policy
 --run runs/<id>` writes a portable `policy.txt` (deterministic policy + obs-normalizer + sim knobs,
-verified faithful to 6.4e-06). A **policy-driven visual runner** is built in the engine submodule:
-`external/engine/tst/physics/visual/amp_policy.cpp` (+ header `policy_net.h`), which loads `policy.txt`,
-rebuilds the training `Environment` (reduced backend), drives it with the policy each control step,
-and renders via the ECS (`world->pose` + `physics_ecs::syncSystem`). Controls: **arrows steer the
-walk command** for goal-conditioned policies (or tilt gravity to perturb balance for stand/getup),
-Space shoves, R resets, P pauses. `export_policy` emits **SIM1_POLICY_V2** with `command_type`/
-`command_dim` so the runner feeds the right goal channels (root-local target); V1 files still load
-(command_dim 0). Build/run (macOS):
+verified faithful to 6.4e-06). The **policy-driven visual runner is owned by sim-1** (relocated out of
+the engine tst tree): `csrc/viz/{main.cpp, policy_net.h}` — a standalone C++ entrypoint (its own
+`main()`, no engine test harness) that loads `policy.txt`, rebuilds the training `Environment`
+(reduced backend), drives it with the policy each control step, and renders via the ECS. It links the
+engine graphics stack as *tools*. Controls: **arrows steer the walk command** for goal-conditioned
+policies (or tilt gravity to perturb balance for stand/getup), Space shoves, R resets, P pauses.
+`export_policy` emits **SIM1_POLICY_V5** (`command_type`/`command_dim`/`rotation`/`frame`/`body_obs`);
+V1–V4 still load.
+
+Two build modes (the pip/wheel build stays headless — `SIM1_BUILD_VIZ` defaults OFF, builds only
+`engine_py`). The visualizer is an **opt-in dev build**:
 ```bash
+# one-time: graphics submodules + slang toolchain in the engine submodule
 git -C external/engine submodule update --init external/{glfw,glm,metal-cpp,stb,tinyobjloader}
-cmake -S external/engine -B external/engine/build && cmake --build external/engine/build --target visuals
-ENGINE_POLICY=runs/<id>/policy.txt ./external/engine/build/tst/visuals amp_policy
+bash external/engine/src/tools/get_slang.sh   # if external/slang is missing
+# configure + build sim1_viz (graphics on). nanobind/Python hints are for the engine_py subdir.
+cmake -S . -B build-viz -DSIM1_BUILD_VIZ=ON \
+  -DPython_EXECUTABLE="$(which python)" -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+cmake --build build-viz --target sim1_viz
+./build-viz/csrc/viz/sim1_viz runs/<id>/policy.txt      # or ENGINE_POLICY=... ./sim1_viz
 ```
-Status: written against the confirmed engine APIs but **not yet compiled here** (graphics submodules
-weren't checked out). Contract + design: `../research/notes/investigations/2026-07-04-policy-visualization-loop.md`.
-Until it's built, verify **numerically** with `sim1.eval` and read `metrics.jsonl`/TensorBoard.
+Status: **built + runs on macOS** (loads a banked policy). Contract + design:
+`../research/notes/investigations/2026-07-04-policy-visualization-loop.md`; ownership rationale:
+`../research/notes/investigations/2026-07-05-cpp-ownership-boundary.md`.
+
+**Observation composition is single-sourced in C++** (`csrc/obs/obs.h`, namespace `sim1::obs`):
+`composeProprioBlock` (proprio incl. rotation/frame) + `composeBodyBlock` (per-body 6D). Both the
+training binding (`PyVecEnv::proprio()`/`body_block()`) and the visualizer (`policy_net.h`) call it,
+and the caller appends the command channels — so a representation change is edited **once** (no more
+Python↔C++ mirror). `sim1/tasks/proprio.py` is retained as the **Python reference oracle** (used by
+the mock env + `tests/test_engine_obs_parity.py`, which asserts engine == oracle to ≤1e-5). On the
+engine backend the env composes obs in C++ (`env.compose_proprio`/`compose_body`); the mock composes
+in Python.
 
 ## 5. Config surface (dotted overrides: `-o section.field=value`)
 Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is deliberately deferred).
@@ -146,6 +163,29 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
   (SuperTrack-style) is the tracking-layer follow-up. The visual runner **does** handle `sixd`: the
   policy file (V3) carries a `rotation` field and `amp_policy.cpp` mirrors the quat→6D conversion
   (`tst::quatTo6D`, matching `proprio.quat_to_6d`) when composing the obs.
+- **`task.frame`** (`world` | `local`): proprioception reference frame. `local` = the character's
+  **heading frame** — root linear+angular velocity are rotated into it and the root orientation has
+  its yaw removed, so the obs is **invariant to world heading** (the generalization win for
+  locomotion / user-steered walk; `walk` uses it, its command channels too). Heading is defined from
+  the body-forward (+Z) axis projected to the ground (`proprio._yaw_from_quat`), which stays additive
+  under world yaw (an Euler-yaw formula does not). **Dim-preserving** (same obs_dim as `world`), but
+  the *values* differ → a `local` policy is a different lineage; don't mix `world`/`local` weights.
+  Default `world` keeps stand/getup and the banked weights unchanged. The C++ visual runner **handles
+  `frame=local`**: the policy file (V4) carries `rotation` + `frame`, and the runner composes the obs
+  via `PolicyNet::composeObs`, mirroring `proprio.py` (remove-yaw + velocity rotation + 6D). The
+  Python and C++ obs paths are checked equal to ~1e-8 across quat/sixd × world/local.
+- **`task.body_obs`** (`bool`, default `false`): append the **SuperTrack per-body 6D** block (the
+  reusable tracking base's proprioception) — per body `[root-relative pos(3) | 6D rot(6) | linvel in
+  root(3) | angvel in root(3) | world height(1)]` + a shared local up-vector(3); AMP 15 bodies ⇒
+  `+243` channels (`per_body_dim`). Full **root-relative** (rotate by root inverse orientation), so
+  it's invariant to global pose (height + up stay world-absolute as tilt/ground cues) — a *different*
+  frame than `task.frame=local` (heading-only), on purpose (SuperTrack faithfulness). Additive +
+  default-off ⇒ existing stand/getup/walk weights untouched; composes with `rotation`/`frame`. Sourced
+  from the engine's per-body world state via the binding (`csrc/engine_py.cpp` — `body_pos/quat/
+  linvel/angvel` zero-copy views; no submodule change). The **C++ visual runner handles it**: policy
+  file V5 carries `body_obs`; `composeObs` builds the per-body block from the Environment's world
+  state, verified equal to Python `per_body_obs` to ~2.4e-7. See
+  `notes/investigations/2026-07-05-per-body-6d.md`.
 - **`ppo`**: `total_steps`, `rollout_len`, `lr`, `anneal_lr`, `gamma`, `gae_lambda`, `clip_coef`,
   `update_epochs`, `num_minibatches`, `ent_coef`, `vf_coef`, `max_grad_norm`, `clip_vloss`,
   `norm_adv`, `norm_obs`, `norm_reward`, `reward_clip`, `hidden_sizes`.

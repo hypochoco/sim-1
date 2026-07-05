@@ -38,3 +38,21 @@ class VecEnv(Protocol):
     def root_twist(self) -> np.ndarray: ...     # (num_envs, 6)  linvel(3) + angvel(3)
     @property
     def contact_flags(self) -> np.ndarray: ...  # (num_envs, nbody)
+
+    # --- per-body world-space state (for the SuperTrack per-body 6D representation) ---
+    # Present on the engine backend + mock. Shapes are (num_envs, nbody, ·); quats are (w, x, y, z).
+    @property
+    def body_pos(self) -> np.ndarray: ...       # (num_envs, nbody, 3)  world position
+    @property
+    def body_quat(self) -> np.ndarray: ...      # (num_envs, nbody, 4)  world orientation (wxyz)
+    @property
+    def body_linvel(self) -> np.ndarray: ...    # (num_envs, nbody, 3)  world linear velocity
+    @property
+    def body_angvel(self) -> np.ndarray: ...    # (num_envs, nbody, 3)  world angular velocity
+
+    # --- observation composition (single source; engine = C++ via binding, mock = Python oracle) ---
+    # Compose the transfer-stable proprioception block [height | root_rot | linvel | angvel | q | qd |
+    # contacts] with the given rotation ("quat"|"sixd") + frame ("world"|"local"). The caller appends
+    # command channels; compose_body() appends the per-body 6D block.
+    def compose_proprio(self, rotation: str, frame: str) -> np.ndarray: ...   # (num_envs, proprio_dim)
+    def compose_body(self) -> np.ndarray: ...                                 # (num_envs, per_body_dim)

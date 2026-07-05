@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from sim1.tasks.command import NoCommand
 from sim1.tasks.composite import CompositeTask
+from sim1.tasks.proprio import BodyFeatures
 from sim1.tasks.rewards import (
     RewardTerm,
     fall_termination,
@@ -40,6 +41,8 @@ class StandTask(CompositeTask):
         position_weight: float = 0.0,
         position_scale: float = 1.0,
         rot_repr: str = "quat",
+        frame: str = "world",
+        body_obs: bool = False,
     ):
         super().__init__(
             ndof,
@@ -57,4 +60,6 @@ class StandTask(CompositeTask):
             terminate_fn=fall_termination(fall_height_frac, upright_fall),
             command_weight=0.0,
             rot_repr=rot_repr,
+            frame=frame,
+            extra_obs=[BodyFeatures(nbody)] if body_obs else (),
         )

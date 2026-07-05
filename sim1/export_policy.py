@@ -8,13 +8,13 @@ the training dynamics, in a flat whitespace-delimited format that C++ parses wit
 Usage:
     python -m sim1.export_policy --run runs/<run_id> [--checkpoint best.pt] [--out <path>]
 
-File format (SIM1_POLICY_V3) — a sequence of `label value` tokens then arrays, read positionally:
-    SIM1_POLICY_V3
+File format (SIM1_POLICY_V5) — a sequence of `label value` tokens then arrays, read positionally:
+    SIM1_POLICY_V5
     model <str> backend <str> action_mode <str>
     substeps <int> control_dt <float> kp <float> kd <float> max_torque <float>
     episode_len <int> fall_height_frac <float> upright_fall <float>
     ndof <int> nbody <int> obs_dim <int> act_dim <int> action_scale <float> norm_eps <float>
-    command_type <str> command_dim <int> rotation <str>   # V2 added command_*; V3 added rotation
+    command_type <str> command_dim <int> rotation <str> frame <str> body_obs <int>   # V2 cmd, V3 rot, V4 frame, V5 body_obs
     norm_mean <obs_dim floats>
     norm_var  <obs_dim floats>
     n_layers <L>
@@ -79,14 +79,18 @@ def export(run: str, checkpoint: str = "best.pt", out: str | None = None) -> Pat
     rotation = task.get("rotation", "quat")
     rot_dim = 6 if rotation == "sixd" else 4
     proprio = 1 + rot_dim + 3 + 3 + 2 * act_dim + nbody
-    command_dim = obs_dim - proprio
+    # per-body 6D block (SuperTrack, rot=sixd): nbody·(pos3 + 6D6 + linvel3 + angvel3 + height1) + up3
+    body_obs = bool(task.get("body_obs", False))
+    per_body = (nbody * (3 + 6 + 3 + 3 + 1) + 3) if body_obs else 0
+    command_dim = obs_dim - proprio - per_body
     command_type = {"walk": "heading_speed"}.get(task["name"], "none")
+    frame = task.get("frame", "world")
 
     def fmt(a: np.ndarray) -> str:
         return " ".join(f"{x:.8e}" for x in np.asarray(a).ravel())
 
     lines = [
-        "SIM1_POLICY_V3",
+        "SIM1_POLICY_V5",
         f"model {env['model']} backend {env.get('backend', 'reduced')} action_mode {env['action_mode']}",
         f"substeps {env['substeps']} control_dt {env['control_dt']:.10g} kp {env['kp']:.10g} "
         f"kd {env['kd']:.10g} max_torque {env['max_torque']:.10g}",
@@ -94,7 +98,8 @@ def export(run: str, checkpoint: str = "best.pt", out: str | None = None) -> Pat
         f"upright_fall {task['upright_fall']:.10g}",
         f"ndof {act_dim} nbody {nbody} "
         f"obs_dim {obs_dim} act_dim {act_dim} action_scale {action_scale:.10g} norm_eps 1e-8",
-        f"command_type {command_type} command_dim {command_dim} rotation {rotation}",
+        f"command_type {command_type} command_dim {command_dim} rotation {rotation} frame {frame} "
+        f"body_obs {int(body_obs)}",
         f"norm_mean {fmt(mean)}",
         f"norm_var {fmt(var)}",
         f"n_layers {len(layers)}",

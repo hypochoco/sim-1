@@ -83,3 +83,31 @@ class MockVecEnv:
     @property
     def contact_flags(self) -> np.ndarray:
         return np.zeros((self.num_envs, self._nbody), dtype=np.float32)
+
+    # --- per-body world-space state (mock: one body at the root, identity orientation, at rest) ---
+    @property
+    def body_pos(self) -> np.ndarray:
+        return np.zeros((self.num_envs, self._nbody, 3), dtype=np.float32)
+
+    @property
+    def body_quat(self) -> np.ndarray:
+        q = np.zeros((self.num_envs, self._nbody, 4), dtype=np.float32)
+        q[:, :, 0] = 1.0  # identity (w, x, y, z)
+        return q
+
+    @property
+    def body_linvel(self) -> np.ndarray:
+        return np.zeros((self.num_envs, self._nbody, 3), dtype=np.float32)
+
+    @property
+    def body_angvel(self) -> np.ndarray:
+        return np.zeros((self.num_envs, self._nbody, 3), dtype=np.float32)
+
+    # --- observation composition (Python oracle; the engine backend uses the C++ binding instead) ---
+    def compose_proprio(self, rotation: str, frame: str) -> np.ndarray:
+        from sim1.tasks.proprio import proprio_obs
+        return proprio_obs(self, rotation, frame)
+
+    def compose_body(self) -> np.ndarray:
+        from sim1.tasks.proprio import per_body_obs
+        return per_body_obs(self, "sixd")

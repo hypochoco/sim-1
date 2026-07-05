@@ -27,7 +27,7 @@ import numpy as np
 
 from sim1.envs.vecenv import VecEnv
 from sim1.tasks.command import Command, NoCommand
-from sim1.tasks.proprio import proprio_dim, proprio_obs
+from sim1.tasks.proprio import proprio_dim
 from sim1.tasks.rewards import RewardTerm, never_terminate
 
 
@@ -50,12 +50,14 @@ class CompositeTask:
         command_weight: float = 1.0,
         extra_obs: Sequence[ObsComponent] = (),
         rot_repr: str = "quat",
+        frame: str = "world",
     ):
         self.ndof = int(ndof)
         self.nbody = int(nbody)
         self.act_dim = int(act_dim)
         self.action_scale = float(action_scale)
         self.rot_repr = rot_repr   # root-orientation obs encoding: "quat" | "sixd"
+        self.frame = frame         # proprioceptive frame: "world" | "local" (heading-relative)
 
         self.command: Command = command if command is not None else NoCommand()
         self.reward_terms = list(reward_terms)
@@ -86,7 +88,7 @@ class CompositeTask:
             self._start_xz[m] = env.root_pose[m][:, [0, 2]]   # re-anchor reset envs to their new spot
 
     def observe(self, env: VecEnv) -> np.ndarray:
-        parts = [proprio_obs(env, self.rot_repr)]
+        parts = [env.compose_proprio(self.rot_repr, self.frame)]   # single obs source (C++ engine / Python mock)
         if self.command.dim:
             parts.append(self.command.to_obs(env, self._goals))
         for c in self.extra_obs:

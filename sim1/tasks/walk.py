@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from sim1.tasks.command import HeadingSpeedCommand
 from sim1.tasks.composite import CompositeTask
+from sim1.tasks.proprio import BodyFeatures
 from sim1.tasks.rewards import (
     RewardTerm,
     fall_termination,
@@ -44,13 +45,15 @@ class WalkTask(CompositeTask):
         fall_height_frac: float = 0.5,
         upright_fall: float = 0.3,
         rot_repr: str = "quat",
+        frame: str = "local",
+        body_obs: bool = False,
     ):
         super().__init__(
             ndof,
             nbody,
             act_dim,
             action_scale,
-            command=HeadingSpeedCommand(speed_range=target_speed_range),
+            command=HeadingSpeedCommand(speed_range=target_speed_range, frame=frame),
             reward_terms=[
                 RewardTerm("alive", alive_bonus, term_alive),
                 RewardTerm("upright", upright_weight, term_upright),
@@ -60,4 +63,6 @@ class WalkTask(CompositeTask):
             terminate_fn=fall_termination(fall_height_frac, upright_fall),
             command_weight=command_weight,
             rot_repr=rot_repr,
+            frame=frame,
+            extra_obs=[BodyFeatures(nbody)] if body_obs else (),
         )

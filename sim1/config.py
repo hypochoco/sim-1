@@ -56,6 +56,8 @@ class TaskConfig:
     position_weight: float = 0.0    # reward for staying near the start (x,z) — stand/getup; 0 = off
     position_scale: float = 1.0     # sharpness of the position-keeping Gaussian
     rotation: str = "quat"          # root-orientation obs encoding: "quat" (4) | "sixd" (continuous 6D)
+    frame: str = "world"            # proprio frame: "world" (raw) | "local" (heading-relative, yaw-invariant)
+    body_obs: bool = False          # append the SuperTrack per-body 6D block (for the reusable tracking base)
     # walk (goal-conditioned locomotion)
     command_weight: float = 1.0     # reward weight on tracking the commanded velocity
     target_speed_min: float = 0.5   # sampled target-speed range (m/s) for the walk command

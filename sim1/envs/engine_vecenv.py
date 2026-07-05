@@ -93,6 +93,30 @@ class EngineVecEnv:
     def contact_flags(self) -> np.ndarray:  # (N, nbody)
         return self._obs[:, 13 + 2 * self.ndof:]
 
+    # --- per-body world-space state (zero-copy 3D views; refreshed on reset/step) ---
+    @property
+    def body_pos(self) -> np.ndarray:       # (N, nbody, 3)
+        return self._env.body_pos()
+
+    @property
+    def body_quat(self) -> np.ndarray:      # (N, nbody, 4) wxyz
+        return self._env.body_quat()
+
+    @property
+    def body_linvel(self) -> np.ndarray:    # (N, nbody, 3)
+        return self._env.body_linvel()
+
+    @property
+    def body_angvel(self) -> np.ndarray:    # (N, nbody, 3)
+        return self._env.body_angvel()
+
+    # --- observation composition (single C++ source via the binding) ---
+    def compose_proprio(self, rotation: str, frame: str) -> np.ndarray:
+        return self._env.proprio(rotation, frame)
+
+    def compose_body(self) -> np.ndarray:
+        return self._env.body_block()
+
 
 def make_vecenv(cfg, seed: int = 0):
     """Factory: return the mock or the real engine-backed VecEnv per `cfg.kind`."""
