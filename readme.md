@@ -41,6 +41,11 @@ pip install -r requirements.txt      # runtime deps: numpy, torch, tensorboard, 
 pip install -e .                     # builds the engine_py binding (headless engine::training)
 ```
 
+On **Linux** the binding additionally needs a discoverable **glm** (required, not optional-graphics;
+point CMake at it with `CMAKE_PREFIX_PATH` if it isn't system-installed) — see
+[`HANDOFF.md`](HANDOFF.md) §3 "Linux build notes". (Position-independent code is already handled in
+`CMakeLists.txt`.)
+
 ## Train / resume / eval
 
 ```bash

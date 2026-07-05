@@ -49,6 +49,20 @@ python -m sim1.train --name reach -o ppo.total_steps=300000 -o env.num_envs=128
 Runs land in `runs/<YYYYMMDD-HHMMSS>_<name>_<gitsha>/` with `config.json` (frozen), `meta.json`
 (seed/sha/host), `metrics.jsonl`, `tb/`, `checkpoints/{best,final,step_*}.pt`.
 
+### Linux build notes (verified on the training box)
+Verified end-to-end on Linux: binding builds, `obs (4, 84)`, `pytest 5 passed`, and a 150k-step stand
+run trained at ~4,400 steps/s (64 CPU envs) with clean metrics. Two specifics vs the Mac:
+
+- **glm is a REQUIRED dependency** (not optional-graphics). The binding's CMake does
+  `find_package(glm REQUIRED)` *outside* the `ENGINE_TRAINING_ONLY` guard: glm is the engine's math
+  library, used everywhere; only GLFW/Metal/Vulkan are graphics-only and guarded out. If glm isn't
+  system-discoverable, point CMake at a prefix (headers + `glmConfig.cmake`):
+  `export CMAKE_PREFIX_PATH=/path/to/glm-prefix`.
+- **Position-independent code** — the engine's static libs must be `-fPIC` to link into the `.so`
+  (Mach-O is PIC by default, so this never surfaced on the Mac). **Handled** by
+  `set(CMAKE_POSITION_INDEPENDENT_CODE ON)` in sim-1's top-level `CMakeLists.txt` — no per-build flag
+  needed.
+
 ## 4. Reading the metrics
 - **`charts/ep_len_mean`** — the clearest `stand` progress signal: it rises as the humanoid falls
   less (episodes hit the time limit instead of terminating on a fall). Max = `env.episode_len`.
@@ -76,12 +90,22 @@ python -m sim1.eval --run runs/<run_id> --episodes 40
 proof (reward can be gamed). Tune the `_SURVIVAL_OK`/`_UPRIGHT_OK` thresholds in `sim1/eval.py`.
 
 **Visual (3D) playback is NOT available in the headless training build** (no renderer — that's the
-whole point of `ENGINE_TRAINING_ONLY`). The engine has a C++ visual runner
-(`external/engine/tst/physics/visual/amp_humanoid.cpp`, Apple-only, interactive) but it is **not
-policy-driven**. True visual confirmation would need a separate full (non-training) engine build plus
-a policy-driven visual runner (export the policy to ONNX/weights and feed its actions) — a future
-task. For now, verify **numerically** with `sim1.eval`; also read `metrics.jsonl`/TensorBoard for the
-training-time `ep_len_mean` trend.
+whole point of `ENGINE_TRAINING_ONLY`). To *watch* a trained policy: `python -m sim1.export_policy
+--run runs/<id>` writes a portable `policy.txt` (deterministic policy + obs-normalizer + sim knobs,
+verified faithful to 6.4e-06). A **policy-driven visual runner is drafted** in the engine submodule:
+`external/engine/tst/physics/visual/amp_policy.cpp` (+ header `policy_net.h`), which loads `policy.txt`,
+rebuilds the training `Environment` (reduced backend), drives it with the policy each control step,
+and renders via the ECS (`world->pose` + `physics_ecs::syncSystem`). Arrow keys tilt gravity, Space
+shoves, R resets, P pauses; an `AgentCommand` seam is plumbed for future goal-conditioned control.
+Build/run (macOS, needs graphics submodules initialized):
+```bash
+git -C external/engine submodule update --init external/{glfw,glm,metal-cpp,stb,tinyobjloader}
+cmake -S external/engine -B external/engine/build && cmake --build external/engine/build --target visuals
+ENGINE_POLICY=runs/<id>/policy.txt ./external/engine/build/tst/visuals amp_policy
+```
+Status: written against the confirmed engine APIs but **not yet compiled here** (graphics submodules
+weren't checked out). Contract + design: `../research/notes/investigations/2026-07-04-policy-visualization-loop.md`.
+Until it's built, verify **numerically** with `sim1.eval` and read `metrics.jsonl`/TensorBoard.
 
 ## 5. Config surface (dotted overrides: `-o section.field=value`)
 Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is deliberately deferred).

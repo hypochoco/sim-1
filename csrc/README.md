@@ -9,7 +9,8 @@ Python `EnvConfig` onto the engine `SimConfig`.
 It links the engine's graphics-free **`engine::training`** aggregate and builds with
 `ENGINE_TRAINING_ONLY=ON` (forced by the top-level `CMakeLists.txt`), so **no graphics / GLFW /
 Metal / Vulkan** is configured — it links clean on a headless Linux box and needs none of the
-engine's graphics submodules initialized.
+engine's **graphics** submodules initialized. The one external it *does* require is **glm** (the
+engine's header/math library, used outside the graphics guard via `find_package(glm REQUIRED)`).
 
 ## Build
 
@@ -26,6 +27,12 @@ The extension installs **package-private** as `sim1.engine_py` (import it as
 `from sim1 import engine_py`, which is what `engine_vecenv.py` does). Requires the engine submodule at
 a commit with the config system + `makeAMPHumanoid` (bumped to `0f69de0`), plus CMake ≥3.15 and a
 C++23 compiler; `scikit-build-core` + `nanobind` are pulled automatically by the build.
+
+**On Linux** (verified on the training box) the binding needs a discoverable **glm**
+(`CMAKE_PREFIX_PATH` → a prefix with `glmConfig.cmake`, if not system-installed). Position-independent
+code (`-fPIC`, needed to link the static engine libs into the `.so`; Mac is PIC by default) is already
+handled by `set(CMAKE_POSITION_INDEPENDENT_CODE ON)` in the top-level `CMakeLists.txt`. See
+`HANDOFF.md` §3 "Linux build notes".
 
 Flip the trainer to the real env with `-o env.kind=engine -o env.model=amp`.
 

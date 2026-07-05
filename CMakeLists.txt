@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
+# The engine's static libs are linked into the engine_py shared object. On Linux they must be built
+# position-independent (-fPIC) to link into a .so; Mach-O is PIC by default so this is a no-op on Mac.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # The C++ engine. Defaults to the pinned submodule; override for local dev against a working copy that
 # has the latest (config system + AMP rig), e.g.:
 #   cmake -DENGINE_SOURCE_DIR=/Users/dseocho/Projects/engine ...
