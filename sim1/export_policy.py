@@ -8,12 +8,13 @@ the training dynamics, in a flat whitespace-delimited format that C++ parses wit
 Usage:
     python -m sim1.export_policy --run runs/<run_id> [--checkpoint best.pt] [--out <path>]
 
-File format (SIM1_POLICY_V1) — a sequence of `label value` tokens then arrays, read positionally:
-    SIM1_POLICY_V1
+File format (SIM1_POLICY_V2) — a sequence of `label value` tokens then arrays, read positionally:
+    SIM1_POLICY_V2
     model <str> backend <str> action_mode <str>
     substeps <int> control_dt <float> kp <float> kd <float> max_torque <float>
     episode_len <int> fall_height_frac <float> upright_fall <float>
     ndof <int> nbody <int> obs_dim <int> act_dim <int> action_scale <float> norm_eps <float>
+    command_type <str> command_dim <int>      # V2: goal channels appended after proprioception
     norm_mean <obs_dim floats>
     norm_var  <obs_dim floats>
     n_layers <L>
@@ -72,18 +73,25 @@ def export(run: str, checkpoint: str = "best.pt", out: str | None = None) -> Pat
 
     action_scale = float(env["max_torque"]) if env["action_mode"] == "torque" else float(task["pd_action_scale"])
 
+    # nbody is rig-defined; command_dim is whatever the obs carries beyond the proprioception block.
+    nbody = {"amp": 15, "humanoid": 14}.get(env["model"], obs_dim - (1 + 4 + 3 + 3 + 2 * act_dim))
+    proprio = 1 + 4 + 3 + 3 + 2 * act_dim + nbody
+    command_dim = obs_dim - proprio
+    command_type = {"walk": "heading_speed"}.get(task["name"], "none")
+
     def fmt(a: np.ndarray) -> str:
         return " ".join(f"{x:.8e}" for x in np.asarray(a).ravel())
 
     lines = [
-        "SIM1_POLICY_V1",
+        "SIM1_POLICY_V2",
         f"model {env['model']} backend {env.get('backend', 'reduced')} action_mode {env['action_mode']}",
         f"substeps {env['substeps']} control_dt {env['control_dt']:.10g} kp {env['kp']:.10g} "
         f"kd {env['kd']:.10g} max_torque {env['max_torque']:.10g}",
         f"episode_len {env['episode_len']} fall_height_frac {task['fall_height_frac']:.10g} "
         f"upright_fall {task['upright_fall']:.10g}",
-        f"ndof {act_dim} nbody {obs_dim - (1 + 4 + 3 + 3 + 2 * act_dim)} "
+        f"ndof {act_dim} nbody {nbody} "
         f"obs_dim {obs_dim} act_dim {act_dim} action_scale {action_scale:.10g} norm_eps 1e-8",
+        f"command_type {command_type} command_dim {command_dim}",
         f"norm_mean {fmt(mean)}",
         f"norm_var {fmt(var)}",
         f"n_layers {len(layers)}",

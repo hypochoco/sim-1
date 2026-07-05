@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -52,8 +53,12 @@ def create_run_dir(runs_root: str, name: str, config_dict: dict[str, Any], seed:
 def _update_latest(runs_root: Path, run_dir: Path) -> None:
     link = runs_root / "latest"
     try:
-        if link.is_symlink() or link.exists():
+        if link.is_symlink() or link.is_file():
             link.unlink()
+        elif link.is_dir():
+            # A zip/copy that dereferenced the symlink turns `latest` into a real directory; unlink()
+            # would raise IsADirectoryError (swallowed below) and `latest` would go stale forever.
+            shutil.rmtree(link)
         link.symlink_to(run_dir.resolve(), target_is_directory=True)
     except OSError:
         pass  # symlinks may be unavailable on some filesystems; non-fatal

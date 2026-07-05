@@ -25,7 +25,9 @@ from sim1.envs.engine_vecenv import make_vecenv
 from sim1.envs.task_env import TaskEnv
 from sim1.tasks.reach import ReachTask
 from sim1.tasks.stand import StandTask
-from sim1.utils.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
+from sim1.tasks.getup import GetUpTask
+from sim1.tasks.walk import WalkTask
+from sim1.utils.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint, step_number
 from sim1.utils.logging import MetricLogger
 from sim1.utils.run_dir import create_run_dir
 from sim1.utils.seeding import seed_everything
@@ -49,10 +51,11 @@ def build_task(cfg: TrainConfig, vecenv):
             action_weight=cfg.task.action_weight,
             target_scale=cfg.env.target_scale,
         )
-    if name == "stand":
+    if name in ("stand", "getup"):
         # torque mode: map unit policy output onto the torque range; PD-target mode: onto radians.
         action_scale = cfg.env.max_torque if cfg.env.action_mode == "torque" else cfg.task.pd_action_scale
-        return StandTask(
+        cls = StandTask if name == "stand" else GetUpTask
+        return cls(
             ndof=vecenv.ndof,
             nbody=vecenv.nbody,
             act_dim=vecenv.act_dim,
@@ -64,7 +67,23 @@ def build_task(cfg: TrainConfig, vecenv):
             fall_height_frac=cfg.task.fall_height_frac,
             upright_fall=cfg.task.upright_fall,
         )
-    raise ValueError(f"unknown task {name!r} (expected 'reach' or 'stand')")
+    if name == "walk":
+        action_scale = cfg.env.max_torque if cfg.env.action_mode == "torque" else cfg.task.pd_action_scale
+        return WalkTask(
+            ndof=vecenv.ndof,
+            nbody=vecenv.nbody,
+            act_dim=vecenv.act_dim,
+            action_scale=action_scale,
+            target_speed_range=(cfg.task.target_speed_min, cfg.task.target_speed_max),
+            upright_weight=cfg.task.upright_weight,
+            height_weight=cfg.task.height_weight,
+            alive_bonus=cfg.task.alive_bonus,
+            action_weight=cfg.task.action_weight,
+            command_weight=cfg.task.command_weight,
+            fall_height_frac=cfg.task.fall_height_frac,
+            upright_fall=cfg.task.upright_fall,
+        )
+    raise ValueError(f"unknown task {name!r} (expected 'reach', 'stand', 'getup', or 'walk')")
 
 
 def build_env(cfg: TrainConfig) -> TaskEnv:
@@ -77,11 +96,33 @@ def _newest_checkpoint(ckpt_dir: Path) -> Path | None:
     final = ckpt_dir / "final.pt"
     if final.exists():
         return final
-    steps = sorted(ckpt_dir.glob("step_*.pt"))
+    steps = sorted(ckpt_dir.glob("step_*.pt"), key=step_number)  # numeric, not lexicographic
     return steps[-1] if steps else None
 
 
-def run_training(cfg: TrainConfig, resume: str | None = None) -> dict:
+def _warm_start(trainer: PPOTrainer, ckpt_path: str, device: str) -> None:
+    """Initialize a FRESH run from a prior policy's weights (transfer / curriculum): load only the
+    network + obs-normalizer, keeping a fresh optimizer/step/rng. Shape-tolerant — tensors that don't
+    match (e.g. the input layer when a new task adds goal channels, or the output layer on a rig
+    change) are skipped and left at their fresh init, so the shared trunk still transfers."""
+    s = load_checkpoint(ckpt_path, map_location=device)
+    src, dst = s["model"], trainer.model.state_dict()
+    loaded, skipped = [], []
+    for k, v in src.items():
+        if k in dst and dst[k].shape == v.shape:
+            dst[k] = v
+            loaded.append(k)
+        else:
+            skipped.append(k)
+    trainer.model.load_state_dict(dst)
+    if trainer.obs_rms is not None and s.get("obs_rms") is not None and \
+       s["obs_rms"]["mean"].shape == trainer.obs_rms.mean.shape:
+        trainer.obs_rms.load_state_dict(s["obs_rms"])
+    print(f"warm-start from {ckpt_path}: loaded {len(loaded)} tensors"
+          + (f", skipped {len(skipped)} (shape mismatch → fresh init): {skipped}" if skipped else ""))
+
+
+def run_training(cfg: TrainConfig, resume: str | None = None, init_from: str | None = None) -> dict:
     device = resolve_device(cfg.run.device)
     seed_everything(cfg.run.seed)
 
@@ -95,6 +136,8 @@ def run_training(cfg: TrainConfig, resume: str | None = None) -> dict:
             trainer.load_state_dict(load_checkpoint(ckpt, map_location=device))
     else:
         run_dir = create_run_dir(cfg.run.runs_root, cfg.run.name, cfg.to_dict(), cfg.run.seed)
+        if init_from:  # warm-start a fresh run from a prior policy (transfer / curriculum)
+            _warm_start(trainer, init_from, device)
 
     logger = MetricLogger(run_dir)
     history: list[dict] = []
@@ -146,6 +189,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="sim1 PPO training (P0)")
     ap.add_argument("--name", type=str, default=None, help="run name")
     ap.add_argument("--resume", type=str, default=None, help="path to an existing run dir to resume")
+    ap.add_argument("--init-from", type=str, default=None,
+                    help="warm-start a FRESH run from a prior checkpoint's weights (transfer/curriculum)")
     ap.add_argument("--device", type=str, default=None, help="cpu | cuda | mps")
     ap.add_argument("--override", "-o", action="append", default=[], help="config override, e.g. ppo.lr=1e-3")
     args = ap.parse_args()
@@ -160,7 +205,7 @@ def main() -> None:
     if args.device:
         cfg.run.device = args.device
 
-    result = run_training(cfg, resume=args.resume)
+    result = run_training(cfg, resume=args.resume, init_from=args.init_from)
     print(f"done. run_dir={result['run_dir']} best_return={result['best_return']:.3f}")
 
 

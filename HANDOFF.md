@@ -92,12 +92,14 @@ proof (reward can be gamed). Tune the `_SURVIVAL_OK`/`_UPRIGHT_OK` thresholds in
 **Visual (3D) playback is NOT available in the headless training build** (no renderer — that's the
 whole point of `ENGINE_TRAINING_ONLY`). To *watch* a trained policy: `python -m sim1.export_policy
 --run runs/<id>` writes a portable `policy.txt` (deterministic policy + obs-normalizer + sim knobs,
-verified faithful to 6.4e-06). A **policy-driven visual runner is drafted** in the engine submodule:
+verified faithful to 6.4e-06). A **policy-driven visual runner** is built in the engine submodule:
 `external/engine/tst/physics/visual/amp_policy.cpp` (+ header `policy_net.h`), which loads `policy.txt`,
 rebuilds the training `Environment` (reduced backend), drives it with the policy each control step,
-and renders via the ECS (`world->pose` + `physics_ecs::syncSystem`). Arrow keys tilt gravity, Space
-shoves, R resets, P pauses; an `AgentCommand` seam is plumbed for future goal-conditioned control.
-Build/run (macOS, needs graphics submodules initialized):
+and renders via the ECS (`world->pose` + `physics_ecs::syncSystem`). Controls: **arrows steer the
+walk command** for goal-conditioned policies (or tilt gravity to perturb balance for stand/getup),
+Space shoves, R resets, P pauses. `export_policy` emits **SIM1_POLICY_V2** with `command_type`/
+`command_dim` so the runner feeds the right goal channels (root-local target); V1 files still load
+(command_dim 0). Build/run (macOS):
 ```bash
 git -C external/engine submodule update --init external/{glfw,glm,metal-cpp,stb,tinyobjloader}
 cmake -S external/engine -B external/engine/build && cmake --build external/engine/build --target visuals
@@ -113,8 +115,14 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
   28-DOF), `backend` (`reduced`|`realtime`), `num_envs`, `episode_len`, `substeps`, `control_dt`,
   `action_mode` (`torque`|`pd_target`), `kp`, `kd`, `max_torque`, `ground_friction`, `threads`
   (0 = all cores). Mock-only: `ndof`, `dt`, `damping`, `action_scale`, `target_scale`.
-- **`task`**: `name` (`reach`|`stand`); stand: `upright_weight`, `height_weight`, `alive_bonus`,
-  `action_weight`, `fall_height_frac`, `upright_fall`, `pd_action_scale`.
+- **`task`**: `name` (`reach`|`stand`|`getup`|`walk`). stand/getup/walk share the canonical
+  proprioception obs + terms: `upright_weight`, `height_weight`, `alive_bonus`, `action_weight`,
+  `fall_height_frac`, `upright_fall`, `pd_action_scale`. `getup` = stand reward with **no fall
+  termination** (recover after falling; use long `env.episode_len` ~1000). `walk` = goal-conditioned
+  locomotion (`command_weight`, `target_speed_min/max`) — obs = proprio + 2 command channels (target
+  planar velocity); the trained policy is user-steerable via `task.set_goal(...)`. Warm-start any of
+  these from a prior policy with `--init-from <ckpt>` (shape-tolerant: shared proprio trunk transfers;
+  mismatched I/O layers re-init).
 - **`ppo`**: `total_steps`, `rollout_len`, `lr`, `anneal_lr`, `gamma`, `gae_lambda`, `clip_coef`,
   `update_epochs`, `num_minibatches`, `ent_coef`, `vf_coef`, `max_grad_norm`, `clip_vloss`,
   `norm_adv`, `norm_obs`, `norm_reward`, `reward_clip`, `hidden_sizes`.
@@ -143,6 +151,37 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
 - **Obs layout** from the binding: `[pos3 | quat_wxyz4 | linvel3 | angvel3 | q[ndof] | qd[ndof] |
   contacts[nbody]]`; `sim1/envs/engine_vecenv.py` slices the named contract fields from it.
 
+## 6b. Bugs found porting to Linux (FIXED)
+Two latent bugs surfaced during a long Linux training run; both are now **fixed in code** (with
+regression tests in `tests/test_run_infra_fixes.py`). Documented here because a run *already in
+flight on another machine* pre-dates the fix — the recovery recipe below applies there.
+
+### Bug 1 — checkpoint files sorted lexicographically (data-loss risk on resume)
+- **Where:** `sim1/utils/checkpoint.py::prune_checkpoints` and `sim1/train.py::_newest_checkpoint`.
+- **Symptom:** once `global_step` crosses a digit-count boundary (≥ 1,000,000, then ≥ 10,000,000),
+  `prune_checkpoints` **deleted the newest** `step_*.pt` and kept stale smaller-step ones, and
+  `--resume` reloaded a **stale early checkpoint**.
+- **Root cause:** `sorted(glob("step_*.pt"))` is a lexicographic **string** sort, so
+  `step_1024000.pt` < `step_901120.pt` (`'1' < '9'`). All 7-digit names sort before 6-digit names;
+  `keep_last` then retained the wrong three and `[-1]` ("newest") was also wrong.
+- **Observed impact:** after an auto-stop at ~6.7M steps, only `step_901120/942080/983040.pt`
+  survived; stock `--resume` would have restarted from **983k** (losing ~5.7M steps). We recovered
+  because **`best.pt` uses a fixed filename** and is immune — it held `global_step=6,303,744`.
+- **Fix:** sort numerically by the embedded step in both places (`checkpoint.step_number()`).
+- **Recovery recipe (for the pre-fix in-flight run):** if a naive resume looks like it restarted too
+  early, resume from the best snapshot: `cp runs/<id>/checkpoints/best.pt runs/<id>/checkpoints/final.pt`
+  then `python -m sim1.train --resume runs/<id>` (`best.pt` carries full model/opt/rms/rng/step).
+
+### Bug 2 — `runs/latest` silently stops updating after a transfer
+- **Where:** `sim1/utils/run_dir.py::_update_latest`.
+- **Symptom:** `runs/latest` froze on an old run, so `--resume runs/latest` / `--run runs/latest` /
+  TensorBoard silently targeted the wrong run.
+- **Root cause:** a zip/copy that **dereferences the symlink** turns `latest` into a real directory;
+  `link.unlink()` then raised `IsADirectoryError` (an `OSError`) which the `except OSError: pass`
+  swallowed — so it was never recreated (and wasted disk as a copy).
+- **Fix:** detect a real directory and `shutil.rmtree` it before re-creating the symlink.
+- **Workaround (pre-fix checkouts):** `rm -rf runs/latest && ln -s <newest_run_dir> runs/latest`.
+
 ## 7. Architecture / where to change things
 ```
 engine (C++, submodule)          sim-1 (this repo, Python)
@@ -158,8 +197,13 @@ engine (C++, submodule)          sim-1 (this repo, Python)
                                    sim1/train.py           build_env → build_task → run loop
                                    sim1/eval.py            deterministic rollout
 ```
-- **Add a task:** implement the `Task` protocol (`sim1/tasks/base.py`) and register it in
-  `sim1/train.py:build_task`. Tasks compose obs from the raw `VecEnv` fields and own reward/termination.
+- **Add a task:** prefer the composable system — build a `CompositeTask` (`sim1/tasks/composite.py`)
+  from a `Command` (`sim1/tasks/command.py`, the goal/user-control seam), `RewardTerm`s
+  (`sim1/tasks/rewards.py`), and a termination fn, reusing the canonical `proprio_obs`
+  (`sim1/tasks/proprio.py`) so weights stay transferable; `walk.py` is the worked example. Register it
+  in `sim1/train.py:build_task`. (The older `reach`/`stand`/`getup` are hand-rolled but proprio-
+  identical.) Mocap plugs in as a reference `ObsComponent` + an imitation `RewardTerm` — see
+  `sim1/motion/` and the architecture note.
 - **Tune the sim:** change `env.*` overrides (substeps, kp/kd, action_mode, friction) — no code edits.
 
 ## 8. Next steps (prioritized)

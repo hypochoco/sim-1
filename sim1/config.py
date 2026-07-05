@@ -41,18 +41,22 @@ class EnvConfig:
 
 @dataclass
 class TaskConfig:
-    name: str = "reach"             # "reach" (mock) | "stand" (humanoid)
+    name: str = "reach"             # "reach" (mock) | "stand" | "getup" | "walk" (humanoid)
     # reach (mock)
     pos_weight: float = 1.0
     vel_weight: float = 0.0
     action_weight: float = 0.01
-    # stand (humanoid)
+    # stand / getup / walk (humanoid) — shared proprio + terms
     upright_weight: float = 1.0     # reward for the torso staying vertical
     height_weight: float = 1.0      # reward for the root staying near its standing height
     alive_bonus: float = 1.0        # per-step reward for not having fallen
     fall_height_frac: float = 0.5   # terminate when root height < frac * standing height
     upright_fall: float = 0.3       # terminate when uprightness (world up · torso up) < this
     pd_action_scale: float = 1.0    # PD-target mode: policy output → target (radians / rotvec)
+    # walk (goal-conditioned locomotion)
+    command_weight: float = 1.0     # reward weight on tracking the commanded velocity
+    target_speed_min: float = 0.5   # sampled target-speed range (m/s) for the walk command
+    target_speed_max: float = 1.5
 
 
 @dataclass
