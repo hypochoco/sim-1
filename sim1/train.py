@@ -106,6 +106,7 @@ def build_task(cfg: TrainConfig, vecenv):
             action_scale=action_scale,
             motion=motion,
             control_dt=cfg.env.control_dt,
+            reward_name=cfg.task.track_reward,
             pose_weight=cfg.task.track_pose_weight,
             vel_weight=cfg.task.track_vel_weight,
             ee_weight=cfg.task.track_ee_weight,

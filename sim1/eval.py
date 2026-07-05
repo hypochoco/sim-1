@@ -46,6 +46,7 @@ def evaluate(run: str, checkpoint: str = "best.pt", episodes: int = 40, device: 
     trainer.load_state_dict(load_checkpoint(ckpt, map_location=dev))
 
     is_stand = cfg.task.name == "stand"
+    is_track = cfg.task.name == "track"
     n = env.num_envs
 
     ep_returns: list[float] = []
@@ -55,6 +56,8 @@ def evaluate(run: str, checkpoint: str = "best.pt", episodes: int = 40, device: 
     ep_len = np.zeros(n, dtype=np.int64)
     up_sum = h_sum = 0.0
     step_count = 0
+    term_sums: dict[str, float] = {}   # track: per-term reward accumulation (eval-side diagnostic)
+    term_steps = 0
 
     obs = trainer._process_obs(env.reset(), update=False)
     target_h = float(np.mean(env.task._target_h)) if is_stand else float("nan")
@@ -74,6 +77,11 @@ def evaluate(run: str, checkpoint: str = "best.pt", episodes: int = 40, device: 
             up_sum += float(np.sum(up))
             h_sum += float(np.sum(h))
             step_count += n
+
+        if is_track:   # accumulate the reward variant's per-term means (computed in task.reward)
+            for k, v in env.task.reward_info.items():
+                term_sums[k] = term_sums.get(k, 0.0) + v
+            term_steps += 1
 
         for i in np.nonzero(done)[0]:
             ep_returns.append(float(ep_ret[i]))
@@ -107,6 +115,18 @@ def evaluate(run: str, checkpoint: str = "best.pt", episodes: int = 40, device: 
         print(f"  mean root height    {mean_h:8.3f} m (standing ≈ {target_h:.3f} m)")
         print(f"  VERDICT: {'STANDING ✓' if standing else 'NOT STANDING ✗'} "
               f"(needs survival ≥ {_SURVIVAL_OK:.0%} and uprightness ≥ {_UPRIGHT_OK})")
+
+    if is_track and term_steps:
+        breakdown = {k: v / term_steps for k, v in term_sums.items()}
+        result["reward_variant"] = cfg.task.track_reward
+        result["reward_terms"] = breakdown
+        survival = float(np.mean(ep_survived))
+        result["survival_rate"] = survival
+        print(f"  reward variant      {cfg.task.track_reward}")
+        print(f"  survival rate       {survival * 100:7.1f}%   (reached the time limit without diverging)")
+        print("  per-term reward (mean over rollout):")
+        for k, v in breakdown.items():
+            print(f"      {k:9s} {v:7.3f}")
 
     return result
 

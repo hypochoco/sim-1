@@ -73,7 +73,7 @@ def test_phase_advances_and_wraps():
 
 def test_early_termination_on_divergence():
     env, task, motion = _make()
-    task.term_pos_err = 0.05                      # tighten so a rest-vs-stride mismatch trips it
+    task._reward.term_pos_err = 0.05             # tighten so a rest-vs-stride mismatch trips it
     task.reset(env, seed=0)
     env.reset(0)                                  # diverge the sim (rest) from a mid-stride phase
     task._ref_time[:] = 0.4 * motion.duration
@@ -84,7 +84,7 @@ def test_early_termination_on_divergence():
 def test_heading_frame_is_direction_invariant():
     # The reward's comparison features must be invariant to a global heading (yaw) rotation.
     from sim1.tasks.proprio import _quat_mul
-    from sim1.tasks.track import _heading_frame
+    from sim1.tasks.track_rewards import heading_frame
 
     rng = np.random.default_rng(0)
     n, b = 3, 15
@@ -93,7 +93,7 @@ def test_heading_frame_is_direction_invariant():
     bq /= np.linalg.norm(bq, axis=-1, keepdims=True)
     bl = rng.standard_normal((n, b, 3)).astype(np.float32)
     ba = rng.standard_normal((n, b, 3)).astype(np.float32)
-    f0 = _heading_frame(bp, bq, bl, ba)
+    f0 = heading_frame(bp, bq, bl, ba)
 
     yaw = 1.2                                              # apply an arbitrary global yaw about +Y
     cy, sy = np.cos(yaw), np.sin(yaw)
@@ -101,7 +101,7 @@ def test_heading_frame_is_direction_invariant():
     qy = np.tile(np.array([np.cos(yaw / 2), 0, np.sin(yaw / 2), 0], np.float32), (n * b, 1))
     bp2 = bp @ Ry.T; bl2 = bl @ Ry.T; ba2 = ba @ Ry.T
     bq2 = _quat_mul(qy, bq.reshape(n * b, 4)).reshape(n, b, 4)
-    f1 = _heading_frame(bp2, bq2, bl2, ba2)
+    f1 = heading_frame(bp2, bq2, bl2, ba2)
 
     for a, c in zip(f0, f1):                               # rel_pos, quat, linvel, angvel all unchanged
         assert np.abs(np.asarray(a) - np.asarray(c)).max() < 1e-4

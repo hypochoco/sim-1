@@ -64,6 +64,7 @@ class TaskConfig:
     target_speed_max: float = 1.5
     # track (DeepMimic-style motion imitation)
     motion_clip: str = "amp_humanoid_walk"   # ASE clip name (retargeted to our rig)
+    track_reward: str = "v2"        # reward variant from sim1/tasks/track_rewards.py ("v1" | "v2" | …)
     rsi: bool = True                # reference-state-init: start episodes from random reference frames
     track_pose_weight: float = 0.5  # imitation reward weights (per-body orientation / vel / ee / root)
     track_vel_weight: float = 0.05
