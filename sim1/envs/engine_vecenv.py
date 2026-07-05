@@ -59,6 +59,13 @@ class EngineVecEnv:
     def reset_masked(self, mask: np.ndarray, seed: int = 0) -> None:
         self._env.reset_masked(np.asarray(mask).astype(np.uint8), seed)
 
+    def set_articulation_state(self, pos: np.ndarray, quat: np.ndarray,
+                               lin: np.ndarray, ang: np.ndarray) -> None:
+        """RSI: set every env's articulation from per-body world states (N, nbody, ·), quats wxyz."""
+        self._env.set_articulation_state(
+            np.ascontiguousarray(pos, dtype=np.float32), np.ascontiguousarray(quat, dtype=np.float32),
+            np.ascontiguousarray(lin, dtype=np.float32), np.ascontiguousarray(ang, dtype=np.float32))
+
     def step(self) -> None:
         self._env.step()
 

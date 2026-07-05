@@ -62,6 +62,16 @@ class TaskConfig:
     command_weight: float = 1.0     # reward weight on tracking the commanded velocity
     target_speed_min: float = 0.5   # sampled target-speed range (m/s) for the walk command
     target_speed_max: float = 1.5
+    # track (DeepMimic-style motion imitation)
+    motion_clip: str = "amp_humanoid_walk"   # ASE clip name (retargeted to our rig)
+    rsi: bool = True                # reference-state-init: start episodes from random reference frames
+    track_pose_weight: float = 0.5  # imitation reward weights (per-body orientation / vel / ee / root)
+    track_vel_weight: float = 0.05
+    track_ee_weight: float = 0.2
+    track_root_weight: float = 0.15
+    track_alive_bonus: float = 0.1   # survival bonus (kept small so tracking accuracy drives learning)
+    track_action_weight: float = 0.002  # small control penalty (discourage jitter/high torque)
+    track_term_pos_err: float = 0.5  # RMS root-relative body position error (m) that ends an episode
 
 
 @dataclass

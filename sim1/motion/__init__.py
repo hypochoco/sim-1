@@ -5,5 +5,17 @@ system (a reference `ObsComponent` + an imitation `RewardTerm`). Loader/retarget
 """
 
 from sim1.motion.reference import ImitationReward, MotionLib, ReferenceObs
+from sim1.motion.motion_lib import (
+    AmpMotionLib,
+    ReferenceMotion,
+    ReferenceState,
+    default_motion_path,
+    load_reference_motion,
+    retarget_to_rig,
+)
 
-__all__ = ["MotionLib", "ReferenceObs", "ImitationReward"]
+__all__ = [
+    "MotionLib", "ReferenceObs", "ImitationReward",
+    "AmpMotionLib", "ReferenceMotion", "ReferenceState",
+    "load_reference_motion", "default_motion_path", "retarget_to_rig",
+]

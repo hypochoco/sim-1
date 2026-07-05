@@ -26,11 +26,13 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/core/core.h"
@@ -53,6 +55,7 @@
 #include "engine/physics_ecs/systems.h"
 
 #include "policy_net.h"
+#include "motion_clip.h"
 
 namespace {
 std::vector<std::byte> readFile(const std::string& path) {
@@ -83,29 +86,46 @@ int main(int argc, char** argv) {
     // --- load the exported policy (carries the sim knobs needed to reproduce training) ----------
     const char* polEnv = std::getenv("ENGINE_POLICY");
     const std::string polPath = (argc > 1) ? argv[1] : (polEnv ? polEnv : "policy.txt");
+    // A reference-motion file → kinematic replay (physics bypassed); otherwise a trained policy.
+    const bool replayMode = tst::MotionClip::isMotionFile(polPath);
     tst::PolicyNet policy;
-    try {
-        policy = tst::PolicyNet::load(polPath);
-    } catch (const std::exception& e) {
-        std::printf("FAIL: %s\n  (set ENGINE_POLICY to an exported policy.txt — see sim1.export_policy)\n", e.what());
-        return 1;
+    tst::MotionClip clip;
+    if (replayMode) {
+        try {
+            clip = tst::MotionClip::load(polPath);
+        } catch (const std::exception& e) {
+            std::printf("FAIL: %s\n", e.what());
+            return 1;
+        }
+        std::printf("motion replay: loaded %s — fps=%.3g frames=%d bodies=%d (physics bypassed)\n",
+                    polPath.c_str(), clip.fps, clip.numFrames, clip.numBodies);
+    } else {
+        try {
+            policy = tst::PolicyNet::load(polPath);
+        } catch (const std::exception& e) {
+            std::printf("FAIL: %s\n  (set ENGINE_POLICY to an exported policy.txt — see sim1.export_policy)\n", e.what());
+            return 1;
+        }
+        std::printf("amp_policy: loaded %s — model=%s backend=%s action_mode=%s obs=%d act=%d substeps=%d ground_friction=%.3g rotation=%s frame=%s body_obs=%d command_dim=%d\n",
+                    polPath.c_str(), policy.model.c_str(), policy.backend.c_str(), policy.actionMode.c_str(),
+                    policy.obsDim, policy.actDim, policy.substeps, policy.groundFriction, policy.rotation.c_str(), policy.frame.c_str(),
+                    static_cast<int>(policy.bodyObs), policy.commandDim);
     }
-    std::printf("amp_policy: loaded %s — model=%s backend=%s action_mode=%s obs=%d act=%d substeps=%d rotation=%s frame=%s body_obs=%d command_dim=%d\n",
-                polPath.c_str(), policy.model.c_str(), policy.backend.c_str(), policy.actionMode.c_str(),
-                policy.obsDim, policy.actDim, policy.substeps, policy.rotation.c_str(), policy.frame.c_str(),
-                static_cast<int>(policy.bodyObs), policy.commandDim);
 
     // --- build the env exactly as trained (single Environment == one VecEnv lane) ---------------
     phys::SimConfig sim;
-    sim.backend       = (policy.backend == "reduced") ? phys::Backend::Reduced : phys::Backend::Realtime;
+    sim.backend       = (policy.backend == "realtime") ? phys::Backend::Realtime : phys::Backend::Reduced;
     sim.actionMode    = (policy.actionMode == "pd_target") ? phys::ActionMode::PDTarget : phys::ActionMode::Torque;
     sim.substeps      = policy.substeps;
     sim.controlDt     = static_cast<phys::Real>(policy.controlDt);
     sim.kp            = static_cast<phys::Real>(policy.kp);
     sim.kd            = static_cast<phys::Real>(policy.kd);
     sim.maxTorque     = static_cast<phys::Real>(policy.maxTorque);
+    sim.groundFriction = static_cast<phys::Real>(policy.groundFriction);   // V7: mirror training friction
 
-    const phys::ArticulationDef refDef = (policy.model == "amp") ? phys::makeAMPHumanoid() : phys::makeHumanoid();
+    // Rig: amp (15 bodies) vs humanoid (14). In replay pick by the clip's body count; else the policy.
+    const bool useAmp = replayMode ? (clip.numBodies == 15) : (policy.model == "amp");
+    const phys::ArticulationDef refDef = useAmp ? phys::makeAMPHumanoid() : phys::makeHumanoid();
     penv::EnvConfig envCfg;
     envCfg.articulation = refDef;
     envCfg.sim          = sim;
@@ -116,6 +136,25 @@ int main(int argc, char** argv) {
         std::printf("WARN: env actDim %zu != policy actDim %d (rig mismatch?)\n", env.actDim(), policy.actDim);
     const float standingH = env.rootPose().position.y;   // authored standing height (fall reference)
     const int cmdDim = policy.commandDim;                 // goal channels this policy expects (0 = none)
+
+    // Tracking policy: the "command" channels are actually a (sin, cos) phase clock the viz advances;
+    // an optional reference clip (argv[2] or $ENGINE_MOTION) lets us RSI the character onto the motion.
+    const bool phaseMode = !replayMode && (policy.commandType == "phase");
+    const char* motEnv = std::getenv("ENGINE_MOTION");
+    const std::string refPath = (argc > 2) ? argv[2] : (motEnv ? motEnv : "");
+    tst::MotionClip refClip;
+    bool hasRef = false;
+    double phaseTime = 0.0;
+    if (phaseMode && !refPath.empty() && tst::MotionClip::isMotionFile(refPath)) {
+        try {
+            refClip = tst::MotionClip::load(refPath);
+            hasRef = true;
+            std::printf("tracking: phase clock (period %.3gs) + RSI from %s\n", policy.motionDuration, refPath.c_str());
+        } catch (const std::exception& e) { std::printf("WARN: reference clip failed: %s\n", e.what()); }
+    } else if (phaseMode) {
+        std::printf("tracking: phase clock (period %.3gs); no reference clip → starts from rest "
+                    "(pass one as argv[2] or $ENGINE_MOTION for RSI)\n", policy.motionDuration);
+    }
 
     // --- window + device + pipeline (same scaffold as amp_humanoid) -----------------------------
     if (!glfwInit()) { std::printf("FAIL: glfwInit\n"); return 1; }
@@ -198,6 +237,31 @@ int main(int argc, char** argv) {
     // --- control state (captured by the policy-control system) ----------------------------------
     AgentCommand command;
     bool paused = false;
+    int replayFrame = 0;
+    std::unordered_map<uint32_t, int> ordMap;   // body handle index → rig ordinal (== motion body order)
+    for (size_t i = 0; i < refDef.bodies.size(); ++i)
+        ordMap[env.articulation().bodies[i].index] = static_cast<int>(i);
+
+    // RSI the character onto the reference clip at time t (poses + velocities, via the engine's
+    // setArticulationState); ground/static bodies are left as-is (seeded from the current poses).
+    auto rsiToPhase = [&](double t) {
+        if (!hasRef) return;
+        const int fr = refClip.frameAt(t);
+        auto& w = env.world();
+        std::vector<engine::Transform> P(w.poses().begin(), w.poses().end());
+        std::vector<phys::Vec3> LV(w.linearVelocities().begin(), w.linearVelocities().end());
+        std::vector<phys::Vec3> AV(w.angularVelocities().begin(), w.angularVelocities().end());
+        const auto& bodies = env.articulation().bodies;
+        for (size_t k = 0; k < bodies.size() && static_cast<int>(k) < refClip.numBodies; ++k) {
+            const uint32_t idx = bodies[k].index;
+            P[idx] = refClip.pose(fr, static_cast<int>(k));
+            LV[idx] = refClip.hasVel ? refClip.lin(fr, static_cast<int>(k)) : phys::Vec3(0);
+            AV[idx] = refClip.hasVel ? refClip.ang(fr, static_cast<int>(k)) : phys::Vec3(0);
+        }
+        w.setArticulationState(P, LV, AV);
+    };
+    auto resetEnv = [&]() { env.reset(0); if (phaseMode) { phaseTime = 0.0; rsiToPhase(0.0); } };
+    if (phaseMode) rsiToPhase(0.0);   // start the tracker on the reference manifold
     std::vector<float> packed(env.defaultObsDim());
     std::vector<float> obs;
     obs.reserve(static_cast<size_t>(policy.obsDim));
@@ -210,6 +274,24 @@ int main(int argc, char** argv) {
 
     // Fixed-step sim: compose obs → policy → action → env.step, then sync render transforms.
     ecs::Schedule simSched;
+    if (replayMode) {
+        // Kinematic replay: set each body entity's Transform straight from the reference clip,
+        // advancing one motion frame per fixed step. Physics is bypassed entirely.
+        simSched.add("motion-replay", [&](ecs::World& w) {
+            if (paused) return;
+            const int fr = ((replayFrame % clip.numFrames) + clip.numFrames) % clip.numFrames;
+            w.query<pecs::RigidBody, engine::Transform>().each(
+                [&](ecs::Entity, pecs::RigidBody& rb, engine::Transform& t) {
+                    auto it = ordMap.find(rb.body.index);
+                    if (it != ordMap.end()) {
+                        const engine::Transform& rp = clip.pose(fr, it->second);
+                        t.position = rp.position;
+                        t.rotation = rp.rotation;   // keep the entity's own scale
+                    }
+                });
+            ++replayFrame;
+        });
+    } else {
     simSched.add("policy-control", [&](ecs::World&) {
         if (paused) return;
         env.packDefaultObs(packed);
@@ -218,8 +300,14 @@ int main(int argc, char** argv) {
         // cmd[1]=local forward (move.y).
         const float steerSpeed = 1.0f;
         std::vector<float> cmd(static_cast<size_t>(cmdDim));
-        for (int i = 0; i < cmdDim; ++i)
-            cmd[i] = (i == 0) ? command.move.x * steerSpeed : (i == 1) ? command.move.y * steerSpeed : 0.0f;
+        if (phaseMode) {   // command channels ARE the (sin, cos) phase clock, period motionDuration
+            const double ph = (policy.motionDuration > 0.0) ? (2.0 * 3.14159265358979323846 * phaseTime / policy.motionDuration) : 0.0;
+            if (cmdDim > 0) cmd[0] = static_cast<float>(std::sin(ph));
+            if (cmdDim > 1) cmd[1] = static_cast<float>(std::cos(ph));
+        } else {
+            for (int i = 0; i < cmdDim; ++i)
+                cmd[i] = (i == 0) ? command.move.x * steerSpeed : (i == 1) ? command.move.y * steerSpeed : 0.0f;
+        }
 
         if (policy.bodyObs) {
             // Gather per-body world state (root == body 0), indexed by each articulation body's
@@ -251,21 +339,30 @@ int main(int argc, char** argv) {
         const std::vector<float> act = policy.action(obs);
         env.setAction(act);
         env.step();
+        if (phaseMode && policy.motionDuration > 0.0)   // advance the phase clock (looping)
+            phaseTime = std::fmod(phaseTime + policy.controlDt, policy.motionDuration);
 
         // Auto-reset on fall so the demo runs continuously.
         const engine::Transform rp = env.rootPose();
         const float upright = 1.0f - 2.0f * (rp.rotation.x * rp.rotation.x + rp.rotation.z * rp.rotation.z);
-        if (rp.position.y < policy.fallHeightFrac * standingH || upright < policy.uprightFall)
-            env.reset(0);
+        // Mirror the training env: only stand/walk/track (terminate_on_fall) reset on a fall. A getup
+        // policy trained with no fall termination is left to drop to the floor and recover. A tracking
+        // reset re-RSIs to the reference (via resetEnv).
+        if (policy.terminateOnFall && (rp.position.y < policy.fallHeightFrac * standingH || upright < policy.uprightFall))
+            resetEnv();
     });
     simSched.add("sync", pecs::syncSystem);   // world poses → entity Transforms
+    }
 
     std::vector<render::RenderView> views;
     scene::ExtractedScene extracted;
     double last = glfwGetTime(), accumulator = 0.0;
-    const double fixed = policy.controlDt;
-    std::printf("amp_policy: WASD/right-drag = camera. Arrows %s, Space shoves, R resets, P pauses, Esc quits.\n",
-                cmdDim > 0 ? "steer the walk command" : "tilt gravity (perturb balance)");
+    const double fixed = replayMode ? (1.0 / clip.fps) : policy.controlDt;
+    if (replayMode)
+        std::printf("motion replay: WASD/right-drag = camera, R restarts, P pauses, Esc quits.\n");
+    else
+        std::printf("amp_policy: WASD/right-drag = camera. Arrows %s, Space shoves, R resets, P pauses, Esc quits.\n",
+                    (cmdDim > 0 && !phaseMode) ? "steer the walk command" : "tilt gravity (perturb balance)");
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -279,14 +376,15 @@ int main(int argc, char** argv) {
         if (in.mousePressed(input::MouseButton::Right))  adapter.setCursorCaptured(true);
         if (in.mouseReleased(input::MouseButton::Right)) adapter.setCursorCaptured(false);
         if (in.keyPressed(input::Key::P)) paused = !paused;
-        if (in.keyPressed(input::Key::R)) env.reset(0);
+        if (in.keyPressed(input::Key::R)) { if (replayMode) replayFrame = 0; else resetEnv(); }
 
-        // --- controllability ----------------------------------------------------------------
-        // Goal policies (walk): arrows STEER (feed the command channels). Non-goal (stand/getup):
-        // arrows TILT GRAVITY to perturb balance. Space shoves either way.
+        // --- controllability (policy mode only; replay is pure kinematics) --------------------
+        if (!replayMode) {
+        // Command policies (walk): arrows STEER. Others (stand/getup/track): arrows TILT GRAVITY to
+        // perturb balance (a tracking policy's channels are the phase clock, not steer). Space shoves.
         command.move = glm::vec2(0.0f);
         glm::vec3 g(0.0f, -9.81f, 0.0f);
-        if (cmdDim > 0) {
+        if (cmdDim > 0 && !phaseMode) {
             if (in.keyDown(input::Key::Up))    command.move.y += 1.0f;
             if (in.keyDown(input::Key::Down))  command.move.y -= 1.0f;
             if (in.keyDown(input::Key::Left))  command.move.x -= 1.0f;
@@ -309,6 +407,7 @@ int main(int argc, char** argv) {
             const glm::vec3 av = env.world().angularVelocities()[root.index];
             env.world().setBodyState(root, tp.position, tp.rotation, lv + glm::vec3(0.0f, 0.0f, -2.5f), av);
         }
+        }  // end policy-mode input (skipped during kinematic replay)
 
         while (accumulator >= fixed) { simSched.run(ecsWorld); accumulator -= fixed; }
 

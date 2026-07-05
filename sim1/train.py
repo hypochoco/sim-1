@@ -91,7 +91,34 @@ def build_task(cfg: TrainConfig, vecenv):
             frame=cfg.task.frame,
             body_obs=cfg.task.body_obs,
         )
-    raise ValueError(f"unknown task {name!r} (expected 'reach', 'stand', 'getup', or 'walk')")
+    if name == "track":
+        import numpy as np
+        from sim1.motion.motion_lib import default_motion_path, load_reference_motion, retarget_to_rig
+        from sim1.tasks.track import TrackingTask
+
+        action_scale = cfg.env.max_torque if cfg.env.action_mode == "torque" else cfg.task.pd_action_scale
+        rest = np.asarray(vecenv.body_pos)[0]   # authored (rest) body centers → retarget target
+        motion = retarget_to_rig(load_reference_motion(default_motion_path(cfg.task.motion_clip)), rest)
+        return TrackingTask(
+            ndof=vecenv.ndof,
+            nbody=vecenv.nbody,
+            act_dim=vecenv.act_dim,
+            action_scale=action_scale,
+            motion=motion,
+            control_dt=cfg.env.control_dt,
+            pose_weight=cfg.task.track_pose_weight,
+            vel_weight=cfg.task.track_vel_weight,
+            ee_weight=cfg.task.track_ee_weight,
+            root_weight=cfg.task.track_root_weight,
+            alive_bonus=cfg.task.track_alive_bonus,
+            action_weight=cfg.task.track_action_weight,
+            term_pos_err=cfg.task.track_term_pos_err,
+            fall_height_frac=cfg.task.fall_height_frac,
+            rsi=cfg.task.rsi,
+            rot_repr=cfg.task.rotation,
+            frame=cfg.task.frame,
+        )
+    raise ValueError(f"unknown task {name!r} (expected 'reach', 'stand', 'getup', 'walk', or 'track')")
 
 
 def build_env(cfg: TrainConfig) -> TaskEnv:

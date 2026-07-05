@@ -59,8 +59,8 @@ class TaskEnv:
         if done.any():
             self._reset_counter += 1
             seed = self._seed + 7919 * self._reset_counter
-            self.task.reset_masked(self.env, done, seed)
-            self.env.reset_masked(done, seed)
+            self.env.reset_masked(done, seed)          # reset physics first…
+            self.task.reset_masked(self.env, done, seed)  # …then task params / RSI (may set env state)
             self._ep_step[done] = 0
             obs = self.task.observe(self.env)  # fresh obs for the continuing rollout
 

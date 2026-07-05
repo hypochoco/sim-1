@@ -56,6 +56,11 @@ class MockVecEnv:
         self._qd += (a - self.damping * self._qd) * self.dt
         self._q += self._qd * self.dt
 
+    def set_articulation_state(self, pos: np.ndarray, quat: np.ndarray,
+                               lin: np.ndarray, ang: np.ndarray) -> None:
+        # The mock is a reduced-order toy (root only); RSI/tracking needs the full engine rig.
+        raise NotImplementedError("set_articulation_state (RSI/tracking) requires the engine backend")
+
     # --- contract: writable action buffer ---
     @property
     def actions(self) -> np.ndarray:

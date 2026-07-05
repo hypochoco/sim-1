@@ -28,6 +28,7 @@
 #include "engine/physics/config.h"
 #include "engine/physics/config_io.h"
 #include "engine/physics/dynamics/articulation.h"
+#include "engine/physics/diff/diff_environment.h"
 #include "engine/physics_env/vec_env.h"
 
 #include "obs/obs.h"   // the single C++ obs-composition source (shared with the visualizer)
@@ -35,6 +36,7 @@
 namespace nb = nanobind;
 namespace pe = engine::physics_env;
 namespace ph = engine::physics;
+namespace pd = engine::physics::diff;
 
 // Owns a ThreadPool + VecEnv together (VecEnv borrows the pool) and derives the SoA layout offsets.
 struct PyVecEnv {
@@ -96,6 +98,71 @@ struct PyVecEnv {
         refreshBodies();
     }
     void step() { env.step(); refreshBodies(); }
+
+    // Reference-state-init: set every env's articulation from per-body world states (N, nbody, ·),
+    // quats (w,x,y,z). Builds a full per-world body-indexed array (seeded from the current poses so
+    // static bodies like the ground are preserved) and calls the engine's setArticulationState.
+    void set_articulation_state(nb::ndarray<const float, nb::ndim<3>, nb::c_contig> pos,
+                                nb::ndarray<const float, nb::ndim<3>, nb::c_contig> quat,
+                                nb::ndarray<const float, nb::ndim<3>, nb::c_contig> lin,
+                                nb::ndarray<const float, nb::ndim<3>, nb::c_contig> ang) {
+        const std::size_t B = nbody;
+        const float* pp = pos.data();  const float* qq = quat.data();
+        const float* ll = lin.data();  const float* aa = ang.data();
+        for (std::size_t i = 0; i < num_envs; ++i) {
+            auto& w = env.env(i).world();
+            std::vector<engine::Transform> P(w.poses().begin(), w.poses().end());
+            std::vector<ph::Vec3> LV(w.linearVelocities().begin(), w.linearVelocities().end());
+            std::vector<ph::Vec3> AV(w.angularVelocities().begin(), w.angularVelocities().end());
+            const auto& bodies = env.env(i).articulation().bodies;
+            for (std::size_t k = 0; k < B; ++k) {
+                const std::size_t idx = bodies[k].index;
+                const std::size_t o3 = (i * B + k) * 3, o4 = (i * B + k) * 4;
+                P[idx].position = ph::Vec3(pp[o3], pp[o3 + 1], pp[o3 + 2]);
+                P[idx].rotation = ph::Quat(qq[o4], qq[o4 + 1], qq[o4 + 2], qq[o4 + 3]);   // w,x,y,z
+                LV[idx] = ph::Vec3(ll[o3], ll[o3 + 1], ll[o3 + 2]);
+                AV[idx] = ph::Vec3(aa[o3], aa[o3 + 1], aa[o3 + 2]);
+            }
+            w.setArticulationState(P, LV, AV);
+        }
+        refreshBodies();
+    }
+};
+
+// ---- Differentiable environment (SHAC/tracking spike) -----------------------------------------
+// Read-only binding of engine::physics::diff::DiffEnvironment (the FD-validated differentiable twin
+// of physics_env::Environment). Exposes stepping + per-body world readback + the per-step tangent
+// Jacobian + a concrete analytic rollout-gradient (objective = final qd[0], seeds the first 4 action
+// components — mirrors the engine's diff_environment.cpp FD test). No engine change — pure consumption.
+struct PyDiffEnv {
+    pd::DiffEnvironment env;
+    std::vector<double> qd_, jac_;
+    std::vector<float>  link_pos_;
+    int jac_rows_ = 0, jac_cols_ = 0;
+
+    PyDiffEnv(const std::string& model, const std::string& contact, double control_dt, int substeps)
+        : env(model == "amp" ? ph::makeAMPHumanoid() : ph::makeHumanoid(),
+              contact == "all" ? pd::DiffContact::All
+                               : (contact == "feet" ? pd::DiffContact::Feet : pd::DiffContact::None),
+              pd::V3<double>{0.0, -9.81, 0.0}, control_dt, substeps) {}
+
+    void   reset()            { env.reset(); }
+    void   step()             { env.step(); }
+    int    action_dim() const { return env.actionDim(); }
+    int    nbody()      const { return static_cast<int>(env.model().links.size()); }
+    double substep_dt() const { return env.substepDt(); }
+
+    void set_action(nb::ndarray<const double, nb::ndim<1>> a) {
+        env.setAction(std::vector<double>(a.data(), a.data() + a.shape(0)));
+    }
+
+    // Analytic gradient of (final qd[0]) over an nSteps rollout w.r.t. the first 4 action components,
+    // via the engine's forward-mode dual rolloutGradient — the exact objective the engine FD-tests.
+    std::vector<double> rollout_grad_qd0(nb::ndarray<const double, nb::ndim<1>> a, int nSteps) {
+        std::vector<double> action(a.data(), a.data() + a.shape(0));
+        return env.rolloutGradient<4>(action, nSteps,
+            [](const pd::DiffState<pd::Dual<4>>& st) { return st.qd[0]; });
+    }
 };
 
 NB_MODULE(engine_py, m) {
@@ -152,6 +219,8 @@ NB_MODULE(engine_py, m) {
         .def_ro("nbody", &PyVecEnv::nbody)
         .def("reset", &PyVecEnv::reset, nb::arg("seed") = 0)
         .def("reset_masked", &PyVecEnv::reset_masked, nb::arg("mask"), nb::arg("seed") = 0)
+        .def("set_articulation_state", &PyVecEnv::set_articulation_state,
+             nb::arg("pos"), nb::arg("quat"), nb::arg("lin"), nb::arg("ang"))
         .def("step", &PyVecEnv::step)
         // zero-copy WRITABLE (N, act_dim) view; `self` is the owner so the buffer stays alive.
         .def("actions", [](nb::object self_obj) {
@@ -220,5 +289,48 @@ NB_MODULE(engine_py, m) {
                     v.body_composed_);
             std::size_t shape[2] = { v.num_envs, dim };
             return nb::ndarray<nb::numpy, const float, nb::ndim<2>>(v.body_composed_.data(), 2, shape, self_obj);
+        });
+
+    // Differentiable environment (read-only spike surface).
+    nb::class_<PyDiffEnv>(m, "DiffEnv")
+        .def(nb::init<const std::string&, const std::string&, double, int>(),
+             nb::arg("model") = "amp", nb::arg("contact") = "none",
+             nb::arg("control_dt") = 1.0 / 60.0, nb::arg("substeps") = 0)
+        .def_prop_ro("action_dim", &PyDiffEnv::action_dim)
+        .def_prop_ro("nbody", &PyDiffEnv::nbody)
+        .def_prop_ro("substep_dt", &PyDiffEnv::substep_dt)
+        .def("reset", &PyDiffEnv::reset)
+        .def("step", &PyDiffEnv::step)
+        .def("set_action", &PyDiffEnv::set_action, nb::arg("action"))
+        .def("rollout_grad_qd0", &PyDiffEnv::rollout_grad_qd0, nb::arg("action"), nb::arg("n_steps"))
+        // joint velocity qd (ndofJoints,) — a readable observable for FD gradient checks.
+        .def("qd", [](nb::object self_obj) {
+            PyDiffEnv& v = nb::cast<PyDiffEnv&>(self_obj);
+            const auto& qd = v.env.state().qd;
+            v.qd_.assign(qd.begin(), qd.end());
+            std::size_t shape[1] = { v.qd_.size() };
+            return nb::ndarray<nb::numpy, const double, nb::ndim<1>>(v.qd_.data(), 1, shape, self_obj);
+        })
+        // per-body world position (nbody, 3), for the diff↔forward trajectory cross-check.
+        .def("link_pos", [](nb::object self_obj) {
+            PyDiffEnv& v = nb::cast<PyDiffEnv&>(self_obj);
+            const auto links = v.env.links();
+            v.link_pos_.resize(links.size() * 3);
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                v.link_pos_[i * 3 + 0] = static_cast<float>(links[i].pos.x);
+                v.link_pos_[i * 3 + 1] = static_cast<float>(links[i].pos.y);
+                v.link_pos_[i * 3 + 2] = static_cast<float>(links[i].pos.z);
+            }
+            std::size_t shape[2] = { links.size(), 3 };
+            return nb::ndarray<nb::numpy, const float, nb::ndim<2>>(v.link_pos_.data(), 2, shape, self_obj);
+        })
+        // per-step tangent Jacobian ∂s_{t+1}/∂(s_t,a_t), shape (nState, nInput).
+        .def("jacobian", [](nb::object self_obj) {
+            PyDiffEnv& v = nb::cast<PyDiffEnv&>(self_obj);
+            const pd::StepJacobian j = v.env.jacobian();
+            v.jac_ = j.J;
+            v.jac_rows_ = j.nState; v.jac_cols_ = j.nInput;
+            std::size_t shape[2] = { static_cast<std::size_t>(v.jac_rows_), static_cast<std::size_t>(v.jac_cols_) };
+            return nb::ndarray<nb::numpy, const double, nb::ndim<2>>(v.jac_.data(), 2, shape, self_obj);
         });
 }

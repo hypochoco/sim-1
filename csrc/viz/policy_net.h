@@ -28,6 +28,7 @@ struct PolicyNet {
     std::string model, backend, actionMode;         // "amp"/"humanoid", "reduced"/"realtime", "pd_target"/"torque"
     int    substeps = 1;
     double controlDt = 1.0 / 60.0, kp = 0, kd = 0, maxTorque = 0;
+    double groundFriction = 0.9;                     // V7: ground-plane friction (SimConfig default)
     int    episodeLen = 0;
     double fallHeightFrac = 0, uprightFall = 0;
     // --- policy shape ---
@@ -38,6 +39,8 @@ struct PolicyNet {
     std::string rotation = "quat";      // V3: root-orientation obs encoding ("quat" | "sixd")
     std::string frame = "world";        // V4: proprio frame ("world" | "local" heading-relative)
     bool   bodyObs = false;             // V5: append the SuperTrack per-body 6D block
+    bool   terminateOnFall = true;      // V6: does the task end an episode on a fall? (getup = false)
+    double motionDuration = 0.0;        // V8: reference clip period (s) for the phase clock (tracking)
     std::vector<float> mean, var;                    // obs normalizer (running stats), length obsDim
     struct Layer { int out = 0, in = 0; std::vector<float> W, b; };  // W row-major [out][in]
     std::vector<Layer> layers;                       // forward order; tanh on all but the last
@@ -46,9 +49,10 @@ struct PolicyNet {
         std::ifstream f(path);
         if (!f) throw std::runtime_error("PolicyNet: cannot open " + path);
         std::string tag; f >> tag;
-        const int version = (tag == "SIM1_POLICY_V5") ? 5 : (tag == "SIM1_POLICY_V4") ? 4
-                          : (tag == "SIM1_POLICY_V3") ? 3 : (tag == "SIM1_POLICY_V2") ? 2
-                          : (tag == "SIM1_POLICY_V1") ? 1 : 0;
+        const int version = (tag == "SIM1_POLICY_V8") ? 8 : (tag == "SIM1_POLICY_V7") ? 7
+                          : (tag == "SIM1_POLICY_V6") ? 6 : (tag == "SIM1_POLICY_V5") ? 5
+                          : (tag == "SIM1_POLICY_V4") ? 4 : (tag == "SIM1_POLICY_V3") ? 3
+                          : (tag == "SIM1_POLICY_V2") ? 2 : (tag == "SIM1_POLICY_V1") ? 1 : 0;
         if (version == 0) throw std::runtime_error("PolicyNet: bad magic '" + tag + "'");
 
         PolicyNet p;
@@ -64,6 +68,7 @@ struct PolicyNet {
         key("kp");           f >> p.kp;
         key("kd");           f >> p.kd;
         key("max_torque");   f >> p.maxTorque;
+        if (version >= 7) { key("ground_friction"); f >> p.groundFriction; }
         key("episode_len");  f >> p.episodeLen;
         key("fall_height_frac"); f >> p.fallHeightFrac;
         key("upright_fall");     f >> p.uprightFall;
@@ -77,6 +82,8 @@ struct PolicyNet {
         if (version >= 3) { key("rotation");     f >> p.rotation; }
         if (version >= 4) { key("frame");        f >> p.frame; }
         if (version >= 5) { key("body_obs");     int bo = 0; f >> bo; p.bodyObs = (bo != 0); }
+        if (version >= 6) { key("terminate_on_fall"); int t = 1; f >> t; p.terminateOnFall = (t != 0); }
+        if (version >= 8) { key("motion_duration"); f >> p.motionDuration; }
         key("norm_mean");    p.mean.resize(p.obsDim); for (float& x : p.mean) f >> x;
         key("norm_var");     p.var.resize(p.obsDim);  for (float& x : p.var)  f >> x;
         key("n_layers");     int L = 0; f >> L;
