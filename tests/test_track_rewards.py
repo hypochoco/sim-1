@@ -77,7 +77,61 @@ def test_v2_rewards_forward_progress():
 
 def test_all_outputs_finite_and_shaped():
     ref, sim = _state(seed=4), _state(seed=5)
-    for name in ("v1", "v2"):
+    for name in ("v1", "v2", "v3"):
         out = make_reward(name, NB).evaluate(sim, ref, _A)
         assert out.total.shape == (1,) and np.isfinite(out.total).all()
         assert out.failed.shape == (1,) and out.failed.dtype == bool
+
+
+# --- v3: simplified, correctly-scaled pure-imitation reward -------------------------------------
+def _rotate_bodies(st: BodyState, angle: float, bodies) -> BodyState:
+    """Return a copy of `st` with the given bodies' orientations rotated by `angle` rad about +X."""
+    from sim1.tasks.proprio import _quat_mul
+    q = st.body_quat.copy()
+    rot = np.array([np.cos(angle / 2), np.sin(angle / 2), 0.0, 0.0], np.float32)
+    for b in bodies:
+        q[0, b] = _quat_mul(rot[None], q[0, b][None])[0]
+    return BodyState(st.body_pos, q, st.body_linvel, st.body_angvel)
+
+
+def test_v3_info_keys_and_reward_bounded_0_1():
+    ref = _state(seed=7)
+    v3 = make_reward("v3", NB)
+    match = v3.evaluate(ref, ref, _A)
+    assert set(match.info) == {"pose", "ee", "vel", "root"}      # no alive/progress/slip/ctrl
+    assert abs(match.total.mean() - 1.0) < 1e-4                  # weights sum to 1 → match == 1
+    off = v3.evaluate(_rotate_bodies(ref, 0.5, range(1, NB)), ref, _A).total.mean()
+    assert 0.0 <= off < 1.0                                      # bounded in [0, 1]
+
+
+def test_v3_mean_normalization_is_responsive_where_v2_saturates():
+    # A realistic ~25 deg/body orientation error: v3 must stay in the responsive band; v2 saturates ~0.
+    ref = _state(seed=8)
+    sim = _rotate_bodies(ref, 0.44, range(1, NB))               # 0.44 rad ≈ 25 deg on every non-root body
+    p_v3 = make_reward("v3", NB).evaluate(sim, ref, _A).info["pose"]
+    p_v2 = make_reward("v2", NB).evaluate(sim, ref, _A).info["pose"]
+    assert 0.2 < p_v3 < 0.8, p_v3                               # gradient available
+    assert p_v2 < 0.02, p_v2                                    # v2 (summed) is dead here
+    assert p_v3 > 20 * p_v2
+
+
+def test_v3_reward_disfavors_shuffle_without_premature_termination():
+    # Limb orientations wildly off but positions fine & upright: the reward must punish it (low pose),
+    # yet NOT terminate on orientation — an untrained policy looks like this early and needs room to learn.
+    ref = _state(seed=9)
+    shuffle = _rotate_bodies(ref, 1.2, range(1, NB))           # ~69 deg/body, positions unchanged
+    out = make_reward("v3", NB).evaluate(shuffle, ref, _A)
+    assert out.info["pose"] < 0.05                             # orientation error is penalized in reward
+    assert out.total.mean() < 1.0                              # below a perfect match
+    assert bool(out.failed[0]) is False                        # but not terminated → bootstrapping room
+
+
+def test_v3_terminates_on_position_divergence_and_fall():
+    ref = _state(seed=10)
+    v3 = make_reward("v3", NB)
+    far = _state(seed=10)
+    far.body_pos[0, 1:] = far.body_pos[0, 1:] + np.array([0.6, 0.0, 0.0], np.float32)  # limbs 0.6m off root
+    assert bool(v3.evaluate(far, ref, _A).failed[0]) is True   # position backstop
+    fallen = _state(seed=10)
+    fallen.body_pos[0, 0, 1] = 0.2                             # root collapsed (< 0.5 · ref height 1.0)
+    assert bool(v3.evaluate(fallen, ref, _A).failed[0]) is True  # fall

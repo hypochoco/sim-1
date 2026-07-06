@@ -64,7 +64,7 @@ class TaskConfig:
     target_speed_max: float = 1.5
     # track (DeepMimic-style motion imitation)
     motion_clip: str = "amp_humanoid_walk"   # ASE clip name (retargeted to our rig)
-    track_reward: str = "v2"        # reward variant from sim1/tasks/track_rewards.py ("v1" | "v2" | …)
+    track_reward: str = "v3"        # reward variant from sim1/tasks/track_rewards.py ("v1" | "v2" | "v3" | …)
     rsi: bool = True                # reference-state-init: start episodes from random reference frames
     track_pose_weight: float = 0.5  # imitation reward weights (per-body orientation / vel / ee / root)
     track_vel_weight: float = 0.05
@@ -94,6 +94,18 @@ class PPOConfig:
     norm_obs: bool = True
     norm_reward: bool = True        # normalize rewards by the running std of the discounted return
     reward_clip: float = 10.0       # clip normalized rewards to +/- this (0 disables)
+    # --- exploration (keep exploration alive / periodically revive it to escape local minima) ---
+    # (1a) cyclical entropy: a cosine "restart" that periodically bumps the entropy bonus back up.
+    ent_cycle_iters: int = 0        # >0: length (in PPO updates) of one entropy cycle; 0 = constant ent_coef
+    ent_cycle_max: float = 0.0      # peak entropy coefficient at the start of each cycle (decays to ent_coef)
+    # (1b) trust region: early-stop the update epochs once the policy has moved too far.
+    target_kl: float = 0.0          # >0: stop the epoch loop when approx_kl exceeds this
+    # (1c) don't let the annealed lr decay all the way to zero (preserves late-training exploration).
+    lr_final_frac: float = 0.0      # anneal lr down to this fraction of lr (0.0 = to zero; old behavior)
+    # (3) adaptive parameter-space noise (Plappert et al.): structured, weight-space exploration.
+    param_noise: bool = False       # perturb the actor's weights during rollout collection
+    param_noise_init: float = 0.01  # initial per-weight noise std
+    param_noise_target: float = 0.1 # target action-space RMS distance between clean & perturbed policy
     hidden_sizes: tuple[int, ...] = (128, 128)
 
 

@@ -196,7 +196,43 @@ class RewardV2(TrackingReward):
         return RewardOut(total.astype(np.float32), info, self._failed(e))
 
 
-REGISTRY: dict[str, type[TrackingReward]] = {"v1": RewardV1, "v2": RewardV2}
+class RewardV3(TrackingReward):
+    """Simplified, correctly-scaled PURE-imitation reward. Errors are MEAN-normalized (per body / per
+    EE), so the DeepMimic-style exp coefficients sit in the responsive band at *realistic* tracking
+    errors (calibrated from a rollout) instead of saturating to ~0. Only pose/vel/ee/root — no
+    alive/progress/slip/ctrl:
+      - survival pressure comes from the strictly-positive per-step reward + orientation-aware early
+        termination (surviving another step always banks more return than terminating),
+      - forward progress is implicit: the reference phase advances, so staying matched = walking.
+    Weights sum to 1 → total ∈ [0, 1]. Termination is **fall + a loosened position backstop**
+    (DeepMimic-style) — NOT a tight per-joint orientation gate: an untrained policy diverges in
+    orientation within ~1 step, so an orientation gate tight enough to catch the converged shuffle also
+    blocks bootstrapping. The shuffle is instead disfavored by the *reward* (responsive, pose-dominant),
+    which v2's saturated reward could not do."""
+    name = "v3"
+
+    def __init__(self, nbody, *, pose_weight=0.65, ee_weight=0.15, vel_weight=0.10, root_weight=0.10, **kw):
+        kw.setdefault("term_pos_err", 0.5)   # loosened backstop (was 0.3); reward drives tracking quality
+        super().__init__(nbody, **kw)
+        self.w_pose, self.w_ee, self.w_vel, self.w_root = pose_weight, ee_weight, vel_weight, root_weight
+        # calibrated (data-grounded) so r=0.5 at realistic errors: ~25°/body, ~10cm/EE, ~1.5 vel.
+        self.a_pose, self.a_ee, self.a_vel, self.a_root = 3.5, 70.0, 0.3, 10.0
+        self._n_noroot = max(1, self.nbody - 1)
+        self._n_ee = max(1, len(self.ee))
+
+    def evaluate(self, sim, ref, actions) -> RewardOut:
+        e = track_errors(sim, ref, self.ee, self.nbody)
+        r_pose = np.exp(-self.a_pose * e.ori / self._n_noroot)         # mean-normalized → responsive
+        r_ee = np.exp(-self.a_ee * e.ee / self._n_ee)
+        r_vel = np.exp(-self.a_vel * e.vel / self.nbody)
+        r_root = np.exp(-self.a_root * e.root)
+        total = self.w_pose * r_pose + self.w_ee * r_ee + self.w_vel * r_vel + self.w_root * r_root
+        info = {"pose": float(r_pose.mean()), "ee": float(r_ee.mean()),
+                "vel": float(r_vel.mean()), "root": float(r_root.mean())}
+        return RewardOut(total.astype(np.float32), info, self._failed(e))   # base: position RMS + fall
+
+
+REGISTRY: dict[str, type[TrackingReward]] = {"v1": RewardV1, "v2": RewardV2, "v3": RewardV3}
 
 
 def make_reward(name: str, nbody: int, **kwargs) -> TrackingReward:

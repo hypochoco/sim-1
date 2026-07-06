@@ -186,6 +186,7 @@ def run_training(cfg: TrainConfig, resume: str | None = None, init_from: str | N
     while trainer.global_step < total:
         if cfg.ppo.anneal_lr:
             frac = max(0.0, 1.0 - trainer.iteration / trainer.num_iterations)
+            frac = cfg.ppo.lr_final_frac + (1.0 - cfg.ppo.lr_final_frac) * frac  # floor at lr_final_frac
             for g in trainer.opt.param_groups:
                 g["lr"] = frac * base_lr
 

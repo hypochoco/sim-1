@@ -40,7 +40,7 @@ class TrackingTask(CompositeTask):
         motion: ReferenceMotion,
         control_dt: float,
         *,
-        reward_name: str = "v2",
+        reward_name: str = "v3",
         pose_weight: float = 0.5,
         vel_weight: float = 0.05,
         ee_weight: float = 0.2,
