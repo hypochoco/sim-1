@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from sim1.envs.mock_vecenv import MockVecEnv
-from sim1.tasks.command import HeadingSpeedCommand, NoCommand
+from sim1.tasks.command import CompositeCommand, DiscreteCommand, HeadingSpeedCommand, NoCommand
 from sim1.tasks.composite import CompositeTask
 from sim1.tasks.proprio import proprio_dim, proprio_obs
 from sim1.tasks.rewards import RewardTerm, fall_termination, term_alive, term_upright
@@ -52,6 +52,29 @@ def test_heading_speed_command():
     assert np.allclose(cmd.to_obs(env, g), g)
     r = cmd.reward(env, g)
     assert r.shape == (env.num_envs,) and np.all((r >= 0) & (r <= 1))
+
+
+def test_discrete_command_one_hot():
+    env = _env()
+    cmd = DiscreteCommand(n_skills=6)
+    assert cmd.dim == 6
+    g = cmd.sample(env.num_envs, np.random.default_rng(0))
+    assert g.shape == (env.num_envs, 1) and np.all((g >= 0) & (g < 6))   # goal = skill index
+    oh = cmd.to_obs(env, g)
+    assert oh.shape == (env.num_envs, 6)
+    assert np.array_equal(oh.sum(axis=1), np.ones(env.num_envs))          # exactly one-hot
+    assert np.array_equal(oh.argmax(axis=1), g[:, 0].astype(int))         # hot == sampled skill
+    assert np.all(cmd.reward(env, g) == 0.0)                              # reward := imitation term
+
+
+def test_discrete_command_composes_with_heading():
+    env = _env()
+    cmd = CompositeCommand([HeadingSpeedCommand(), DiscreteCommand(n_skills=4)])
+    assert cmd.dim == 2 + 4
+    g = cmd.sample(env.num_envs, np.random.default_rng(1))
+    obs = cmd.to_obs(env, g)
+    assert obs.shape == (env.num_envs, 6)
+    assert np.array_equal(obs[:, 2:].sum(axis=1), np.ones(env.num_envs))  # discrete block one-hot
 
 
 def test_stand_behavior_matches_closed_form():

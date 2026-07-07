@@ -271,6 +271,15 @@ class AmpMotionLib:
             body_pos=body_pos, body_quat=bq, body_linvel=body_lin, body_angvel=body_ang,
         )
 
+    def sample_amp_transitions(self, n: int, dt: float, rng: np.random.Generator, clip: int = 0) -> np.ndarray:
+        """Sample n *real* (s, s') transitions from the clip as AMP features — the discriminator's
+        positive examples. Times are drawn uniformly and `dt` matches the policy's control step so the
+        real and fake transitions are directly comparable. Returns (n, amp_obs_dim(nbody))."""
+        from sim1.tasks.track_rewards import amp_transition   # local import to avoid a cycle
+        dur = self._clips[clip].duration
+        t0 = rng.uniform(0.0, max(1e-6, dur - dt), size=n)
+        return amp_transition(self.state_at(t0, clip), self.state_at(t0 + dt, clip))
+
 
 def retarget_to_rig(motion: ReferenceMotion, rest_body_pos: np.ndarray, ground: bool = True) -> ReferenceMotion:
     """Rotation-based retarget: reproduce the motion on OUR rig's proportions.

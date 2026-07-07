@@ -71,6 +71,68 @@ run trained at ~4,400 steps/s (64 CPU envs) with clean metrics. Two specifics vs
   `set(CMAKE_POSITION_INDEPENDENT_CODE ON)` in sim-1's top-level `CMakeLists.txt` — no per-build flag
   needed.
 
+## 3b. Motion tracking (DeepMimic) + AMP — the current frontier
+Beyond stand/getup/walk, the live work is **single-clip motion tracking** (`task.name=track`) and an
+**AMP** (adversarial motion prior) style reward. Status: the **walk tracker is done** — v3 reward, 48M
+steps, 100% survival, pose 0.76 / ee 0.82 (see
+`../research/notes/investigations/2026-07-06-reward-v3-simplification.md`). AMP is implemented and
+smoke-tested (this handoff), for **naturalness** (the walk is stiff — locks the elbows straight).
+
+**Tracking.** DeepMimic-style: RSI (reference-state-init via the engine `set_articulation_state`),
+a phase clock in the obs, and an imitation reward selected by **`task.track_reward`** (a registry in
+`sim1/tasks/track_rewards.py`, recorded in `config.json`): `v1` (baseline), `v2` (foot-slip/progress —
+superseded), **`v3` (default)** = mean-normalized pose/ee/vel/root, reward ∈ [0,1], fall + position
+termination. The ASE clips live in a **sibling** repo (`humanoid-motion/ASE/...`); set
+`SIM1_MOTIONS_DIR` if not auto-found. Per-term reward breakdown is printed by `sim1.eval` for `track`
+(python-side; not logged during training). Train:
+```bash
+python -m sim1.train -o env.kind=engine -o task.name=track -o task.track_reward=v3 \
+  -o env.model=amp -o env.action_mode=pd_target -o task.frame=local -o env.substeps=48 \
+  -o task.motion_clip=amp_humanoid_walk -o env.num_envs=4096 -o env.episode_len=1000 \
+  -o ppo.total_steps=100000000 -o run.device=cuda -o run.name=track_walk
+```
+
+**Exploration knobs** (opt-in, off by default; `sim1/algos/ppo.py`): `ppo.ent_coef` + cyclical entropy
+(`ent_cycle_iters`, `ent_cycle_max`), `ppo.target_kl` (early-stop; measured vs the clean pre-update
+policy so it composes with param-noise), `ppo.lr_final_frac` (lr floor), and **adaptive
+parameter-space noise** (`ppo.param_noise`, Plappert). The plain-PPO v3 walk did NOT need these (no
+entropy collapse), but they're there for stickier local minima. See
+`2026-07-06-training-exploration-changes.md`.
+
+**AMP** (`sim1/models/discriminator.py`, wired in `ppo.py`/`train.py`; design:
+`2026-07-07-amp-integration.md`). An LSGAN discriminator over **heading-frame body-feature
+transitions** (reused from the tracking reward → identical layout for sim vs reference) yields an
+**additive** style reward: reward = `amp_task_weight·r_track + amp_style_weight·r_style` (both ~[0,1]).
+**Trainer-side** (the style reward needs the torch discriminator; the env exposes nothing new — the
+trainer reads the sim body state via a callable). **Training-only: the discriminator is never
+exported; the actor + `sim1_viz` are unchanged.** Best run as a **fine-tune** of the converged v3 walk:
+```bash
+python -m sim1.train --init-from runs/<v3_walk>/checkpoints/best.pt \
+  -o env.kind=engine -o task.name=track -o task.track_reward=v3 -o env.model=amp \
+  -o env.action_mode=pd_target -o task.frame=local -o env.substeps=48 -o env.num_envs=4096 -o env.episode_len=1000 \
+  -o ppo.total_steps=50000000 -o run.device=cuda -o run.name=track_walk_amp \
+  -o ppo.amp_enabled=true -o ppo.amp_task_weight=0.5 -o ppo.amp_style_weight=0.5
+```
+> **Gotcha (sanity-check bite):** a `--init-from` fine-tune starts a **fresh run from CLI config** — it
+> must **match the base run's `env.*` params**, especially **`env.substeps=48`** (default is 8). With
+> too few substeps the contact physics destabilizes and the loaded (good) policy falls in ~20 steps —
+> looks like a broken warm-start but is really an env mismatch. `--init-from` restores the net + obs
+> normalizer (verified: task reward ~0.6 from step 0, tracking preserved as AMP layers on).
+Watch `amp/disc_acc` (falls from ~1.0 toward ~0.5–0.8 as the policy becomes mocap-like; ~0.5 = D
+fooled), `charts/amp_style_reward` (should rise), and re-check the elbow/knee bend (the `bend`
+diagnostic) to confirm the arms unstiffen. Tune `amp_style_weight` up if still stiff, down if tracking
+degrades. `charts/reward_mean` + `ep_return` stay on the **task** reward (AMP-agnostic → comparable to
+non-AMP runs).
+
+**Visualize a tracking policy** (the reference ghost + RSI need the motion file):
+```bash
+python -m sim1.export_policy --run <run> --checkpoint final.pt      # → <run>/policy.txt
+python -m sim1.export_motion --name amp_humanoid_walk --out <run>/walk.motion.txt
+./build-viz/csrc/viz/sim1_viz <run>/policy.txt <run>/walk.motion.txt
+```
+Note: pulled-in runs sometimes land in a **nested** `<run>/<run>/` dir — point at the inner one (newest
+checkpoints/metrics live there).
+
 ## 4. Reading the metrics
 - **`charts/ep_len_mean`** — the clearest `stand` progress signal: it rises as the humanoid falls
   less (episodes hit the time limit instead of terminating on a fall). Max = `env.episode_len`.
@@ -140,7 +202,7 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
   28-DOF), `backend` (`reduced`|`realtime`), `num_envs`, `episode_len`, `substeps`, `control_dt`,
   `action_mode` (`torque`|`pd_target`), `kp`, `kd`, `max_torque`, `ground_friction`, `threads`
   (0 = all cores). Mock-only: `ndof`, `dt`, `damping`, `action_scale`, `target_scale`.
-- **`task`**: `name` (`reach`|`stand`|`getup`|`walk`). stand/getup/walk share the canonical
+- **`task`**: `name` (`reach`|`stand`|`getup`|`walk`|`track`). stand/getup/walk share the canonical
   proprioception obs + terms: `upright_weight`, `height_weight`, `alive_bonus`, `action_weight`,
   `fall_height_frac`, `upright_fall`, `pd_action_scale`. `getup` = stand reward with **no fall
   termination** (recover after falling; use long `env.episode_len` ~1000). `walk` = goal-conditioned
@@ -189,6 +251,11 @@ Defaults are dataclasses in `sim1/config.py` (the Hydra-style framework is delib
 - **`ppo`**: `total_steps`, `rollout_len`, `lr`, `anneal_lr`, `gamma`, `gae_lambda`, `clip_coef`,
   `update_epochs`, `num_minibatches`, `ent_coef`, `vf_coef`, `max_grad_norm`, `clip_vloss`,
   `norm_adv`, `norm_obs`, `norm_reward`, `reward_clip`, `hidden_sizes`.
+  - *Exploration (opt-in, off by default):* `ent_cycle_iters`, `ent_cycle_max` (cyclical entropy),
+    `target_kl` (trust-region early-stop), `lr_final_frac` (lr floor), `param_noise`,
+    `param_noise_init`, `param_noise_target` (adaptive parameter-space noise).
+  - *AMP (opt-in, off by default; track task):* `amp_enabled`, `amp_task_weight`, `amp_style_weight`,
+    `amp_disc_hidden`, `amp_grad_penalty`, `amp_lr`, `amp_disc_updates`.
 - **`run`**: `name`, `seed`, `device` (`cpu`|`cuda`|`mps` — auto-falls back), `runs_root`,
   `checkpoint_interval`, `keep_last`.
 

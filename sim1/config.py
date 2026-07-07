@@ -106,6 +106,14 @@ class PPOConfig:
     param_noise: bool = False       # perturb the actor's weights during rollout collection
     param_noise_init: float = 0.01  # initial per-weight noise std
     param_noise_target: float = 0.1 # target action-space RMS distance between clean & perturbed policy
+    # --- AMP (adversarial motion prior): additive, trainer-side style reward toward mocap-like motion ---
+    amp_enabled: bool = False       # add a discriminator style reward (track task only); training-only
+    amp_task_weight: float = 0.5    # weight on the task (v3 tracking) reward
+    amp_style_weight: float = 0.5   # weight on the discriminator style reward (both ~[0,1])
+    amp_disc_hidden: tuple[int, ...] = (256, 256)
+    amp_grad_penalty: float = 10.0  # weight of the gradient penalty on real samples (AMP stabilizer)
+    amp_lr: float = 1e-4            # discriminator learning rate
+    amp_disc_updates: int = 2       # discriminator SGD steps per PPO iteration
     hidden_sizes: tuple[int, ...] = (128, 128)
 
 

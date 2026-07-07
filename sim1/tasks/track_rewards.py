@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sim1.tasks.proprio import _quat_mul, _yaw_from_quat
+from sim1.tasks.proprio import _quat_mul, _yaw_from_quat, quat_to_6d
 
 HANDS_AND_FEET = (5, 8, 13, 14)   # end-effectors in our feet-last body order
 FEET = (13, 14)
@@ -64,6 +64,31 @@ def foot_slip(sim, feet, height_thresh: float = 0.08) -> np.ndarray:
     horiz2 = v[..., 0] ** 2 + v[..., 2] ** 2
     contact = (fy < height_thresh).astype(np.float32)
     return np.sum(contact * horiz2, axis=1)
+
+
+# --- AMP (adversarial motion prior) features -------------------------------------------------
+def amp_features(state) -> np.ndarray:
+    """Per-frame AMP observation for the discriminator: flattened heading-frame per-body features
+    (root-relative position, 6D rotation, linear + angular velocity) + root height. Computed via the
+    SAME `heading_frame` used by the tracking reward, so it is **byte-identical in layout** whether
+    `state` is the sim `BodyState` or a reference `ReferenceState` (both expose body_pos/quat/lin/ang).
+    Yaw-removed + root-relative → invariant to global position/heading (the AMP property). (N, B*15+1)."""
+    rel, q, lv, av = heading_frame(state.body_pos, state.body_quat, state.body_linvel, state.body_angvel)
+    n, b = rel.shape[0], rel.shape[1]
+    rot6 = quat_to_6d(q.reshape(n * b, 4)).reshape(n, b, 6)
+    per_body = np.concatenate([rel, rot6, lv, av], axis=2).reshape(n, b * 15)     # [pos3|6D6|lin3|ang3]
+    root_h = np.asarray(state.body_pos)[:, 0, 1:2]                                # absolute root height cue
+    return np.concatenate([per_body, root_h], axis=1).astype(np.float32)
+
+
+def amp_transition(s0, s1) -> np.ndarray:
+    """A discriminator sample = two consecutive frames' AMP features concatenated (so D sees motion)."""
+    return np.concatenate([amp_features(s0), amp_features(s1)], axis=1).astype(np.float32)
+
+
+def amp_obs_dim(nbody: int) -> int:
+    """Dimension of one AMP transition (2 frames)."""
+    return 2 * (nbody * 15 + 1)
 
 
 @dataclass

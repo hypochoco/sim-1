@@ -86,6 +86,34 @@ class HeadingSpeedCommand:
         return np.exp(-self.track_scale * err).astype(np.float32)
 
 
+class DiscreteCommand:
+    """A categorical control input (which skill / attack / combo / clip), presented to the policy as a
+    **one-hot** observation. The goal is the selected skill INDEX (sampled uniformly during training;
+    set by a button / high-level policy at inference). Frame-independent (unlike spatial commands).
+
+    Reward is 0 here **by design**: a discrete skill's achievement is scored by the *imitation* reward
+    for the clip/skill it selects (the reference/tracking `RewardTerm`), not by the command itself —
+    the command only carries the selection and conditions the observation. This is the small primitive
+    the control-inputs note flagged as the one missing piece for discrete/combat skills."""
+
+    def __init__(self, n_skills: int):
+        assert n_skills >= 1, "n_skills must be >= 1"
+        self.n_skills = int(n_skills)
+        self.dim = int(n_skills)
+
+    def sample(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        return rng.integers(0, self.n_skills, size=(n, 1)).astype(np.float32)  # goal = skill index
+
+    def to_obs(self, env: VecEnv, goal: np.ndarray) -> np.ndarray:
+        idx = np.clip(goal[:, 0].astype(np.int64), 0, self.n_skills - 1)
+        oh = np.zeros((goal.shape[0], self.n_skills), dtype=np.float32)
+        oh[np.arange(goal.shape[0]), idx] = 1.0
+        return oh
+
+    def reward(self, env: VecEnv, goal: np.ndarray) -> np.ndarray:
+        return np.zeros(goal.shape[0], dtype=np.float32)
+
+
 class CompositeCommand:
     """Concatenate several commands into one (goals, obs channels, and rewards are stacked/summed).
     Lets a controller layer multiple control inputs (the combat case)."""

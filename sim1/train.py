@@ -163,7 +163,24 @@ def run_training(cfg: TrainConfig, resume: str | None = None, init_from: str | N
     seed_everything(cfg.run.seed)
 
     env = build_env(cfg)
-    trainer = PPOTrainer(env, cfg.ppo, device=device, seed=cfg.run.seed)
+
+    # AMP (adversarial motion prior): wire a per-frame feature fn (sim) + real-transition sampler
+    # (reference clip). Track task only; training-only (no export/viz change).
+    amp_obs_fn = amp_sampler = None
+    if cfg.ppo.amp_enabled and cfg.task.name == "track":
+        from sim1.tasks.track_rewards import BodyState, amp_features
+        task = env.task
+        control_dt = cfg.env.control_dt
+
+        def amp_obs_fn(task_env):
+            ve = task_env.env
+            return amp_features(BodyState(ve.body_pos, ve.body_quat, ve.body_linvel, ve.body_angvel))
+
+        def amp_sampler(n, rng):
+            return task._lib.sample_amp_transitions(n, control_dt, rng)
+
+    trainer = PPOTrainer(env, cfg.ppo, device=device, seed=cfg.run.seed,
+                         amp_obs_fn=amp_obs_fn, amp_sampler=amp_sampler)
 
     if resume:
         run_dir = Path(resume)

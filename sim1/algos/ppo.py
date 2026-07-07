@@ -26,10 +26,12 @@ from sim1.config import PPOConfig
 from sim1.envs.running_norm import RunningMeanStd
 from sim1.envs.task_env import TaskEnv
 from sim1.models.mlp import ActorCritic
+from sim1.models.discriminator import Discriminator
 
 
 class PPOTrainer:
-    def __init__(self, env: TaskEnv, cfg: PPOConfig, device: str = "cpu", seed: int = 0):
+    def __init__(self, env: TaskEnv, cfg: PPOConfig, device: str = "cpu", seed: int = 0,
+                 amp_obs_fn=None, amp_sampler=None):
         self.env = env
         self.cfg = cfg
         self.device = torch.device(device)
@@ -67,6 +69,20 @@ class PPOTrainer:
         self._ret_acc = np.zeros(self.num_envs, dtype=np.float64)  # discounted-return accumulator
 
         self._obs = self._process_obs(env.reset(), update=True)
+
+        # --- AMP (adversarial motion prior): additive, trainer-side style reward ---
+        self._amp_obs_fn = amp_obs_fn          # task_env -> per-frame features (N, frame_dim)
+        self._amp_sampler = amp_sampler        # (n, rng) -> real transitions (n, amp_dim)
+        self.amp_enabled = bool(cfg.amp_enabled and amp_obs_fn is not None and amp_sampler is not None)
+        if self.amp_enabled:
+            frame_dim = int(self._amp_obs_fn(self.env).shape[1])
+            self.amp_dim = 2 * frame_dim       # a transition = two consecutive frames
+            self.disc = Discriminator(self.amp_dim, tuple(cfg.amp_disc_hidden)).to(self.device)
+            self.amp_opt = torch.optim.Adam(self.disc.parameters(), lr=cfg.amp_lr)
+            self.amp_rms = RunningMeanStd((self.amp_dim,), self.device)
+            self._amp_rng = np.random.default_rng(seed + 777)
+        else:
+            self.disc = None
 
     # --- obs normalization ---
     def _process_obs(self, obs_np, update: bool) -> torch.Tensor:
@@ -152,6 +168,11 @@ class PPOTrainer:
         if self._pnoise_actor is not None:
             self._resample_param_noise()
 
+        amp_style_sum = 0.0
+        if self.amp_enabled:
+            amp_tr_b = torch.zeros((T, N, self.amp_dim), device=dev)
+            amp_prev = self._amp_obs_fn(self.env)      # per-frame AMP features at the rollout start
+
         for t in range(T):
             obs_t = self._obs
             with torch.no_grad():
@@ -161,6 +182,15 @@ class PPOTrainer:
 
             act_np = action.detach().cpu().numpy().astype(np.float32)
             next_obs_np, reward, done, info = self.env.step(act_np)
+            task_reward = reward
+            if self.amp_enabled:
+                post = self._amp_obs_fn(self.env)                              # features of s_{t+1}
+                tr_t = torch.as_tensor(np.concatenate([amp_prev, post], axis=1),
+                                       dtype=torch.float32, device=dev)         # transition (s_t, s_{t+1})
+                self.amp_rms.update(tr_t)
+                style = self.disc.style_reward(self.amp_rms.normalize(tr_t)).cpu().numpy()
+                reward = cfg.amp_task_weight * task_reward + cfg.amp_style_weight * style
+                amp_tr_b[t] = tr_t; amp_prev = post; amp_style_sum += float(style.mean())
 
             with torch.no_grad():
                 next_obs_t = self._process_obs(next_obs_np, update=True)
@@ -172,13 +202,13 @@ class PPOTrainer:
             boot = torch.where(trunc_bool, v_term, torch.zeros_like(v_term))
             nextval_b[t] = torch.where(done_bool, boot, v_next)
             rew_b[t] = torch.as_tensor(self._norm_reward(reward, done), dtype=torch.float32, device=dev)
-            raw_rew_b[t] = torch.as_tensor(reward, dtype=torch.float32, device=dev)
+            raw_rew_b[t] = torch.as_tensor(task_reward, dtype=torch.float32, device=dev)
             done_b[t] = done_bool.float()
 
             self._obs = next_obs_t
             self.global_step += N
 
-            self._ep_ret += reward  # raw reward for reported episode returns
+            self._ep_ret += task_reward  # task reward for reported episode returns (AMP-agnostic)
             self._ep_len += 1
             for i in np.nonzero(done)[0]:
                 self._recent_returns.append(float(self._ep_ret[i]))
@@ -205,11 +235,16 @@ class PPOTrainer:
             "returns": ret_b.reshape(-1),
             "values": val_b.reshape(-1),
         }
+        if self.amp_enabled:
+            batch["amp_transitions"] = amp_tr_b.reshape(-1, self.amp_dim)
+            batch["amp_done"] = done_b.reshape(-1)               # exclude boundary transitions from D
         roll_metrics = {
             "charts/reward_mean": float(raw_rew_b.mean().item()),
             "charts/ep_return_mean": self.recent_return_mean(),
             "charts/ep_len_mean": (float(np.mean(self._recent_lens)) if self._recent_lens else float("nan")),
         }
+        if self.amp_enabled:
+            roll_metrics["charts/amp_style_reward"] = amp_style_sum / T
         if self._pnoise_actor is not None:
             roll_metrics["charts/param_noise_dist"] = self._adapt_param_noise(batch["obs"])
             roll_metrics["charts/param_noise_std"] = self._pnoise_std
@@ -277,6 +312,7 @@ class PPOTrainer:
         explained_var = float("nan") if var_y == 0 else 1.0 - float(np.var(y_true - y_pred)) / var_y
 
         self.iteration += 1
+        amp_metrics = self._update_discriminator(batch) if self.amp_enabled else {}
         return {
             "losses/policy_loss": float(pg_loss.item()),
             "losses/value_loss": float(v_loss.item()),
@@ -287,7 +323,31 @@ class PPOTrainer:
             "losses/clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "losses/grad_norm": grad_norm,
             "losses/explained_variance": explained_var,
+            **amp_metrics,
         }
+
+    def _update_discriminator(self, batch) -> dict:
+        """AMP discriminator step: real (mocap) transitions → +1, policy transitions → −1 (LSGAN),
+        with a gradient penalty on real. Boundary-crossing (post-reset) policy transitions are dropped.
+        Both real and fake are normalized by the running amp-obs stats."""
+        fake_all = batch["amp_transitions"][batch["amp_done"] < 0.5]
+        if fake_all.shape[0] == 0:
+            return {}
+        n = fake_all.shape[0]
+        mb = min(n, 2048)
+        loss_sum = gp_sum = acc_sum = 0.0
+        for _ in range(self.cfg.amp_disc_updates):
+            fake = self.amp_rms.normalize(fake_all[torch.randint(0, n, (mb,), device=self.device)])
+            real_np = self._amp_sampler(mb, self._amp_rng)
+            real = self.amp_rms.normalize(torch.as_tensor(real_np, dtype=torch.float32, device=self.device))
+            loss = self.disc.lsgan_loss(real, fake)
+            gp = self.disc.grad_penalty(real)
+            self.amp_opt.zero_grad()
+            (loss + self.cfg.amp_grad_penalty * gp).backward()
+            self.amp_opt.step()
+            loss_sum += float(loss); gp_sum += float(gp); acc_sum += self.disc.accuracy(real, fake)
+        k = self.cfg.amp_disc_updates
+        return {"amp/disc_loss": loss_sum / k, "amp/grad_penalty": gp_sum / k, "amp/disc_acc": acc_sum / k}
 
     def recent_return_mean(self) -> float:
         return float(np.mean(self._recent_returns)) if self._recent_returns else float("nan")
@@ -302,6 +362,9 @@ class PPOTrainer:
             "global_step": self.global_step,
             "iteration": self.iteration,
             "param_noise_std": self._pnoise_std,
+            "disc": self.disc.state_dict() if self.disc is not None else None,
+            "amp_opt": self.amp_opt.state_dict() if self.disc is not None else None,
+            "amp_rms": self.amp_rms.state_dict() if self.disc is not None else None,
             "torch_rng": torch.get_rng_state(),
             "numpy_rng": np.random.get_state(),
         }
@@ -315,6 +378,10 @@ class PPOTrainer:
             self.ret_rms.load_state_dict(s["ret_rms"])
         self.global_step = int(s["global_step"])
         self.iteration = int(s["iteration"])
+        if self.disc is not None and s.get("disc") is not None:
+            self.disc.load_state_dict(s["disc"])
+            self.amp_opt.load_state_dict(s["amp_opt"])
+            self.amp_rms.load_state_dict(s["amp_rms"])
         if s.get("param_noise_std") is not None:
             self._pnoise_std = float(s["param_noise_std"])
         if s.get("torch_rng") is not None:
