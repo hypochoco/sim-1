@@ -10,7 +10,7 @@
 add_executable(sim1_viz main.cpp)
 target_include_directories(sim1_viz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(sim1_viz PRIVATE
-    engine::scene engine::graphics engine::physics_ecs engine::physics_env
+    engine::scene engine::render engine::rhi engine::physics_ecs engine::physics_env
     engine::input engine::input_glfw engine::controls engine::core)
 
 # Compiled shaders (mesh.metallib etc.) land in ENGINE_SHADER_DIR; depend on the engine `shaders` target.

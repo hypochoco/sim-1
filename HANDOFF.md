@@ -337,6 +337,17 @@ engine (C++, submodule)          sim-1 (this repo, Python)
 - **Tune the sim:** change `env.*` overrides (substeps, kp/kd, action_mode, friction) — no code edits.
 
 ## 8. Next steps (prioritized)
+0. **Verify the CUDA diff-ABA backend on the A10G, then retrain the walk on it.** The engine now has a
+   **differentiable-ABA backend** (`env.kind=diff-cpu` on Mac, `env.kind=cuda` on the A10G) that is the
+   go-forward training physics, and it has been converged with the reduced backend: joint limits +
+   reduced-style velocity damping, SemiImplicit/IMEX contact (`SimConfig.contact_semi_implicit`,
+   default on), and **PD torque recomputed every substep** (a fixed-per-control-step tau had a stale
+   −kd·q̇ term that destabilized PD-hold). CPU (`diff-cpu`) is verified (engine 184/0, sim-1 fidelity
+   tests pass); the **CUDA mirror of the per-substep-PD change is UNVERIFIED on hardware** — build +
+   run on the A10G and confirm parity/stability before trusting it (see
+   `../research/notes/investigations/2026-07-10-diff-backend-convergence.md`). Perf follow-up: the CUDA
+   step is currently `2·substeps` kernel launches — fuse `actionToTau` into `batchedSubstepKernel`.
+   Policies trained under the OLD (stale-PD) dynamics (incl. the CUDA walk) must be **retrained**.
 1. **Benchmark env-steps/s on the target Linux CPU** at `env.num_envs` ∈ {64, 1024, 4096} and set
    `env.threads`. This sets wall-clock (sim is CPU-bound), more than the GPU does.
 2. **Improve `stand`**: longer `episode_len` (300 → ~1000), tune reward weights toward long holds;

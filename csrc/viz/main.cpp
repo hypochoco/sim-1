@@ -56,6 +56,7 @@
 
 #include "policy_net.h"
 #include "motion_clip.h"
+#include "viz_sim.h"
 
 namespace {
 std::vector<std::byte> readFile(const std::string& path) {
@@ -112,7 +113,9 @@ int main(int argc, char** argv) {
                     static_cast<int>(policy.bodyObs), policy.commandDim);
     }
 
-    // --- build the env exactly as trained (single Environment == one VecEnv lane) ---------------
+    // --- build the single-lane sim exactly as trained: reduced/realtime PhysicsWorld, or the
+    // differentiable ABA (DiffVecEnv) for diff-cpu/cuda policies (Option A) ----------------------
+    const bool diffBackend = !replayMode && (policy.backend == "diff-cpu" || policy.backend == "cuda");
     phys::SimConfig sim;
     sim.backend       = (policy.backend == "realtime") ? phys::Backend::Realtime : phys::Backend::Reduced;
     sim.actionMode    = (policy.actionMode == "pd_target") ? phys::ActionMode::PDTarget : phys::ActionMode::Torque;
@@ -126,15 +129,21 @@ int main(int argc, char** argv) {
     // Rig: amp (15 bodies) vs humanoid (14). In replay pick by the clip's body count; else the policy.
     const bool useAmp = replayMode ? (clip.numBodies == 15) : (policy.model == "amp");
     const phys::ArticulationDef refDef = useAmp ? phys::makeAMPHumanoid() : phys::makeHumanoid();
-    penv::EnvConfig envCfg;
-    envCfg.articulation = refDef;
-    envCfg.sim          = sim;
-    penv::Environment env(envCfg);
-    env.reset(0);
 
-    if (static_cast<int>(env.actDim()) != policy.actDim)
-        std::printf("WARN: env actDim %zu != policy actDim %d (rig mismatch?)\n", env.actDim(), policy.actDim);
-    const float standingH = env.rootPose().position.y;   // authored standing height (fall reference)
+    // Replay is pure kinematics (no sim). A policy drives a VizSim (reduced PhysicsWorld or diff ABA).
+    std::unique_ptr<sim1viz::VizSim> sim2;
+    penv::Environment* redEnv = nullptr;   // non-null only on the reduced backend (used for RSI)
+    float standingH = 0.99f;
+    if (!replayMode) {
+        sim2   = sim1viz::makeVizSim(refDef, sim, diffBackend);
+        redEnv = sim2->reducedEnv();
+        if (sim2->actDim() != policy.actDim)
+            std::printf("WARN: env actDim %d != policy actDim %d (rig mismatch?)\n", sim2->actDim(), policy.actDim);
+        standingH = sim2->rootPose().position.y;   // authored standing height (fall reference)
+        std::printf("sim1_viz: backend = %s\n",
+                    diffBackend ? "diff-ABA (DiffVecEnv, live)"
+                                : (policy.backend == "realtime" ? "realtime PhysicsWorld" : "reduced PhysicsWorld"));
+    }
     const int cmdDim = policy.commandDim;                 // goal channels this policy expects (0 = none)
 
     // Tracking policy: the "command" channels are actually a (sin, cos) phase clock the viz advances;
@@ -214,15 +223,14 @@ int main(int argc, char** argv) {
     materials.push_back({ .baseColorFactor = glm::vec4(0.5f, 0.5f, 0.55f, 1.0f) });
     ecsWorld.spawn(Transform{}, scene::RenderMesh{ planeMesh }, scene::RenderMaterial{ 0 });
 
+    std::vector<ecs::Entity> bodyEntity(refDef.bodies.size());
     for (size_t i = 0; i < refDef.bodies.size(); ++i) {
         const auto mat = static_cast<uint32_t>(materials.size());
         glm::vec4 c = glm::vec4(0.42f, 0.62f, 0.85f, 1.0f) * (0.7f + 0.42f * float(i) / float(refDef.bodies.size())); c.a = 1.0f;
         materials.push_back({ .baseColorFactor = c });
-        const engine::Transform pose = env.world().pose(env.articulation().bodies[i]);
-        ecsWorld.spawn(
-            Transform{ .position = pose.position, .rotation = pose.rotation, .scale = bodyScale[i] },
-            scene::RenderMesh{ bodyMesh[i] }, scene::RenderMaterial{ mat },
-            pecs::RigidBody{ env.articulation().bodies[i] });
+        Transform pose{}; pose.scale = bodyScale[i];
+        if (sim2) { const engine::Transform bp = sim2->bodyPose(static_cast<int>(i)); pose.position = bp.position; pose.rotation = bp.rotation; }
+        bodyEntity[i] = ecsWorld.spawn(pose, scene::RenderMesh{ bodyMesh[i] }, scene::RenderMaterial{ mat });
     }
 
     ecsWorld.spawn(Transform{ .position = glm::vec3(0.0f, 1.2f, 4.5f) },
@@ -232,26 +240,22 @@ int main(int argc, char** argv) {
     ecsWorld.setResource(scene::SceneLighting{});
     ecsWorld.setResource(input::InputState{});
     ecsWorld.setResource(Time{});
-    ecsWorld.setResource(pecs::PhysicsWorldRef{ &env.world() });   // for syncSystem
 
     // --- control state (captured by the policy-control system) ----------------------------------
     AgentCommand command;
     bool paused = false;
     int replayFrame = 0;
-    std::unordered_map<uint32_t, int> ordMap;   // body handle index → rig ordinal (== motion body order)
-    for (size_t i = 0; i < refDef.bodies.size(); ++i)
-        ordMap[env.articulation().bodies[i].index] = static_cast<int>(i);
 
-    // RSI the character onto the reference clip at time t (poses + velocities, via the engine's
-    // setArticulationState); ground/static bodies are left as-is (seeded from the current poses).
+    // RSI the character onto the reference clip at time t (poses + velocities). Reduced backend only —
+    // diff RSI needs world→joint-state inversion (deferred); a diff phase policy starts from rest.
     auto rsiToPhase = [&](double t) {
-        if (!hasRef) return;
+        if (!hasRef || !redEnv) return;
         const int fr = refClip.frameAt(t);
-        auto& w = env.world();
+        auto& w = redEnv->world();
         std::vector<engine::Transform> P(w.poses().begin(), w.poses().end());
         std::vector<phys::Vec3> LV(w.linearVelocities().begin(), w.linearVelocities().end());
         std::vector<phys::Vec3> AV(w.angularVelocities().begin(), w.angularVelocities().end());
-        const auto& bodies = env.articulation().bodies;
+        const auto& bodies = redEnv->articulation().bodies;
         for (size_t k = 0; k < bodies.size() && static_cast<int>(k) < refClip.numBodies; ++k) {
             const uint32_t idx = bodies[k].index;
             P[idx] = refClip.pose(fr, static_cast<int>(k));
@@ -260,9 +264,11 @@ int main(int argc, char** argv) {
         }
         w.setArticulationState(P, LV, AV);
     };
-    auto resetEnv = [&]() { env.reset(0); if (phaseMode) { phaseTime = 0.0; rsiToPhase(0.0); } };
-    if (phaseMode) rsiToPhase(0.0);   // start the tracker on the reference manifold
-    std::vector<float> packed(env.defaultObsDim());
+    auto resetEnv = [&]() { if (sim2) sim2->reset(); if (phaseMode) { phaseTime = 0.0; rsiToPhase(0.0); } };
+    if (phaseMode) {
+        if (redEnv) rsiToPhase(0.0);   // start the tracker on the reference manifold
+        else if (diffBackend) std::printf("tracking: RSI unsupported on the diff backend — starting from the authored rest pose.\n");
+    }
     std::vector<float> obs;
     obs.reserve(static_cast<size_t>(policy.obsDim));
     std::vector<float> bodyPos, bodyQuat, bodyLin, bodyAng;   // per-body scratch (body_obs policies)
@@ -275,32 +281,27 @@ int main(int argc, char** argv) {
     // Fixed-step sim: compose obs → policy → action → env.step, then sync render transforms.
     ecs::Schedule simSched;
     if (replayMode) {
-        // Kinematic replay: set each body entity's Transform straight from the reference clip,
-        // advancing one motion frame per fixed step. Physics is bypassed entirely.
-        simSched.add("motion-replay", [&](ecs::World& w) {
+        // Kinematic replay: set each body entity's Transform straight from the reference clip
+        // (entity i == body i == motion body i), advancing one frame per fixed step. Physics bypassed.
+        simSched.add("motion-replay", [&](ecs::World&) {
             if (paused) return;
             const int fr = ((replayFrame % clip.numFrames) + clip.numFrames) % clip.numFrames;
-            w.query<pecs::RigidBody, engine::Transform>().each(
-                [&](ecs::Entity, pecs::RigidBody& rb, engine::Transform& t) {
-                    auto it = ordMap.find(rb.body.index);
-                    if (it != ordMap.end()) {
-                        const engine::Transform& rp = clip.pose(fr, it->second);
-                        t.position = rp.position;
-                        t.rotation = rp.rotation;   // keep the entity's own scale
-                    }
-                });
+            for (size_t i = 0; i < bodyEntity.size() && static_cast<int>(i) < clip.numBodies; ++i) {
+                engine::Transform* t = ecsWorld.get<engine::Transform>(bodyEntity[i]);
+                const engine::Transform& rp = clip.pose(fr, static_cast<int>(i));
+                t->position = rp.position; t->rotation = rp.rotation;   // keep the entity's own scale
+            }
             ++replayFrame;
         });
     } else {
     simSched.add("policy-control", [&](ecs::World&) {
         if (paused) return;
-        env.packDefaultObs(packed);
-        // Build the observation exactly as the trainer did (proprio with rotation+frame encodings),
-        // then append command channels from user input. Convention: cmd[0]=local strafe (move.x),
-        // cmd[1]=local forward (move.y).
+        // Packed obs in the training layout (reduced Environment or diff DiffVecEnv — same contract).
+        const std::span<const float> packed = sim2->packedObs();
+        // Command channels: (sin,cos) phase clock for tracking policies, else user steer intent.
         const float steerSpeed = 1.0f;
         std::vector<float> cmd(static_cast<size_t>(cmdDim));
-        if (phaseMode) {   // command channels ARE the (sin, cos) phase clock, period motionDuration
+        if (phaseMode) {
             const double ph = (policy.motionDuration > 0.0) ? (2.0 * 3.14159265358979323846 * phaseTime / policy.motionDuration) : 0.0;
             if (cmdDim > 0) cmd[0] = static_cast<float>(std::sin(ph));
             if (cmdDim > 1) cmd[1] = static_cast<float>(std::cos(ph));
@@ -310,48 +311,35 @@ int main(int argc, char** argv) {
         }
 
         if (policy.bodyObs) {
-            // Gather per-body world state (root == body 0), indexed by each articulation body's
-            // handle — the per-body 6D block mirrors sim1/tasks/proprio.py::per_body_obs.
-            const auto& bodies = env.articulation().bodies;
-            const auto poses = env.world().poses();
-            const auto lvel  = env.world().linearVelocities();
-            const auto avel  = env.world().angularVelocities();
-            const size_t B = bodies.size();
-            bodyPos.resize(B * 3); bodyQuat.resize(B * 4); bodyLin.resize(B * 3); bodyAng.resize(B * 3);
-            for (size_t k = 0; k < B; ++k) {
-                const uint32_t idx = bodies[k].index;
-                const engine::Transform& T = poses[idx];
-                bodyPos[k * 3 + 0] = T.position.x; bodyPos[k * 3 + 1] = T.position.y; bodyPos[k * 3 + 2] = T.position.z;
-                bodyQuat[k * 4 + 0] = T.rotation.w; bodyQuat[k * 4 + 1] = T.rotation.x;
-                bodyQuat[k * 4 + 2] = T.rotation.y; bodyQuat[k * 4 + 3] = T.rotation.z;
-                const glm::vec3& L = lvel[idx]; bodyLin[k * 3 + 0] = L.x; bodyLin[k * 3 + 1] = L.y; bodyLin[k * 3 + 2] = L.z;
-                const glm::vec3& A = avel[idx]; bodyAng[k * 3 + 0] = A.x; bodyAng[k * 3 + 1] = A.y; bodyAng[k * 3 + 2] = A.z;
-            }
-            obs = policy.composeObs(std::span<const float>(packed.data(), packed.size()),
-                                    std::span<const float>(cmd.data(), cmd.size()),
+            // Per-body world state (root == body 0) — backend-agnostic (mirrors proprio.py::per_body_obs).
+            sim2->bodyState(bodyPos, bodyQuat, bodyLin, bodyAng);
+            obs = policy.composeObs(packed, std::span<const float>(cmd.data(), cmd.size()),
                                     std::span<const float>(bodyPos), std::span<const float>(bodyQuat),
                                     std::span<const float>(bodyLin), std::span<const float>(bodyAng));
         } else {
-            obs = policy.composeObs(std::span<const float>(packed.data(), packed.size()),
-                                    std::span<const float>(cmd.data(), cmd.size()));
+            obs = policy.composeObs(packed, std::span<const float>(cmd.data(), cmd.size()));
         }
 
         const std::vector<float> act = policy.action(obs);
-        env.setAction(act);
-        env.step();
+        sim2->setAction(act);
+        sim2->step();
         if (phaseMode && policy.motionDuration > 0.0)   // advance the phase clock (looping)
             phaseTime = std::fmod(phaseTime + policy.controlDt, policy.motionDuration);
 
-        // Auto-reset on fall so the demo runs continuously.
-        const engine::Transform rp = env.rootPose();
+        // Sync render transforms from the per-body world poses (linkWorld on diff, PhysicsWorld on reduced).
+        for (size_t i = 0; i < bodyEntity.size(); ++i) {
+            engine::Transform* t = ecsWorld.get<engine::Transform>(bodyEntity[i]);
+            const engine::Transform bp = sim2->bodyPose(static_cast<int>(i));
+            t->position = bp.position; t->rotation = bp.rotation;
+        }
+
+        // Auto-reset on fall so the demo runs continuously (stand/walk/track terminate_on_fall; a
+        // getup policy is left to drop + recover; a tracking reset re-RSIs via resetEnv).
+        const engine::Transform rp = sim2->rootPose();
         const float upright = 1.0f - 2.0f * (rp.rotation.x * rp.rotation.x + rp.rotation.z * rp.rotation.z);
-        // Mirror the training env: only stand/walk/track (terminate_on_fall) reset on a fall. A getup
-        // policy trained with no fall termination is left to drop to the floor and recover. A tracking
-        // reset re-RSIs to the reference (via resetEnv).
         if (policy.terminateOnFall && (rp.position.y < policy.fallHeightFrac * standingH || upright < policy.uprightFall))
             resetEnv();
     });
-    simSched.add("sync", pecs::syncSystem);   // world poses → entity Transforms
     }
 
     std::vector<render::RenderView> views;
@@ -396,22 +384,16 @@ int main(int argc, char** argv) {
             if (in.keyDown(input::Key::Left))  g.x -= tilt;
             if (in.keyDown(input::Key::Right)) g.x += tilt;
         }
-        env.world().setGravity(g);
+        sim2->setGravity(g);
 
-        // Space = shove the pelvis (velocity impulse). NOTE: on the reduced backend this nudges the
-        // floating base; a dedicated PhysicsWorld::applyImpulse would be cleaner (see engine plan).
-        if (in.keyPressed(input::Key::Space)) {
-            const phys::BodyHandle root = env.articulation().bodies.front();
-            const engine::Transform tp = env.world().pose(root);
-            const glm::vec3 lv = env.world().linearVelocities()[root.index];
-            const glm::vec3 av = env.world().angularVelocities()[root.index];
-            env.world().setBodyState(root, tp.position, tp.rotation, lv + glm::vec3(0.0f, 0.0f, -2.5f), av);
-        }
+        // Space = shove the pelvis (velocity impulse) — nudges the floating base on both backends.
+        if (in.keyPressed(input::Key::Space)) sim2->shoveRoot(glm::vec3(0.0f, 0.0f, -2.5f));
         }  // end policy-mode input (skipped during kinematic replay)
 
         while (accumulator >= fixed) { simSched.run(ecsWorld); accumulator -= fixed; }
 
-        scene::extract(ecsWorld, pipe, extracted);
+        renderer.setMeshPipeline(pipe);
+        scene::extract(ecsWorld, extracted);
         scene::extractViews(ecsWorld, extracted, views, W, H);
         FrameContext frame = device.beginFrame();
         if (!frame.swapchainTarget().valid()) { device.endFrame(std::move(frame)); continue; }

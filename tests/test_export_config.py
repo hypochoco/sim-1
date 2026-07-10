@@ -18,12 +18,12 @@ from sim1.config import EnvConfig, TaskConfig, TrainConfig
 from sim1.export_policy import export
 
 
-def _write_run(tmp_path, ground_friction):
+def _write_run(tmp_path, ground_friction=0.9, kind="engine"):
     """Minimal run dir: config.json + a checkpoint whose actor_mean matches the stand obs/act dims."""
     ndof, nbody = 28, 15
     obs_dim = 1 + 4 + 3 + 3 + 2 * ndof + nbody           # quat/world proprio, no command/body (=82)
     cfg = TrainConfig(
-        env=EnvConfig(kind="engine", model="amp", num_envs=1, ground_friction=ground_friction),
+        env=EnvConfig(kind=kind, model="amp", num_envs=1, ground_friction=ground_friction),
         task=TaskConfig(name="stand"),
     )
     (tmp_path / "config.json").write_text(json.dumps(cfg.to_dict()))
@@ -46,3 +46,15 @@ def test_export_carries_ground_friction(tmp_path, gf):
     m = re.search(r"ground_friction (\S+)", text)
     assert m is not None, "ground_friction token missing from export"
     assert float(m.group(1)) == pytest.approx(gf)
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("engine", "reduced"),        # PhysicsWorld solver
+    ("diff-cpu", "diff-cpu"),     # diff-ABA runs must NOT mislabel as 'reduced'
+    ("cuda", "cuda"),
+])
+def test_export_backend_label_is_truthful(tmp_path, kind, expected):
+    run = _write_run(tmp_path, kind=kind)
+    export(str(run), checkpoint="best.pt")
+    m = re.search(r"backend (\S+)", (run / "policy.txt").read_text())
+    assert m is not None and m.group(1) == expected

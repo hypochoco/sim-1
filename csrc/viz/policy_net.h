@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <fstream>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,15 @@
 #include "obs/obs.h"   // the single C++ obs-composition source (shared with the training binding)
 
 namespace tst {
+
+// istream `>> float` FAILS on "inf"/"nan" in libc++ (sets failbit), which aborts parsing the rest of
+// the file. Read the token as a string and convert with strtof (which DOES parse inf/nan/-inf), so a
+// normalizer with an inf-variance dim (a constant/ignored obs channel → normalizes to 0, matching the
+// Python trainer) loads correctly instead of failing at 'n_layers'.
+inline float readFloatToken(std::istream& f) {
+    std::string t; f >> t;
+    return t.empty() ? 0.0f : std::strtof(t.c_str(), nullptr);
+}
 
 // A loaded feed-forward Gaussian-policy MEAN network + the sim knobs it was trained with.
 struct PolicyNet {
@@ -84,14 +94,14 @@ struct PolicyNet {
         if (version >= 5) { key("body_obs");     int bo = 0; f >> bo; p.bodyObs = (bo != 0); }
         if (version >= 6) { key("terminate_on_fall"); int t = 1; f >> t; p.terminateOnFall = (t != 0); }
         if (version >= 8) { key("motion_duration"); f >> p.motionDuration; }
-        key("norm_mean");    p.mean.resize(p.obsDim); for (float& x : p.mean) f >> x;
-        key("norm_var");     p.var.resize(p.obsDim);  for (float& x : p.var)  f >> x;
+        key("norm_mean");    p.mean.resize(p.obsDim); for (float& x : p.mean) x = readFloatToken(f);
+        key("norm_var");     p.var.resize(p.obsDim);  for (float& x : p.var)  x = readFloatToken(f);
         key("n_layers");     int L = 0; f >> L;
         for (int i = 0; i < L; ++i) {
             key("layer");
             Layer ly; f >> ly.out >> ly.in;
-            ly.W.resize(static_cast<size_t>(ly.out) * ly.in); for (float& x : ly.W) f >> x;
-            ly.b.resize(ly.out);                               for (float& x : ly.b) f >> x;
+            ly.W.resize(static_cast<size_t>(ly.out) * ly.in); for (float& x : ly.W) x = readFloatToken(f);
+            ly.b.resize(ly.out);                               for (float& x : ly.b) x = readFloatToken(f);
             p.layers.push_back(std::move(ly));
         }
         if (!f) throw std::runtime_error("PolicyNet: truncated/garbled file: " + path);

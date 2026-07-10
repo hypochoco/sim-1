@@ -15,7 +15,7 @@ from typing import Any
 
 @dataclass
 class EnvConfig:
-    kind: str = "mock"              # "mock" (P0) | "engine" (P1, when the binding lands)
+    kind: str = "mock"              # "mock" | "engine" (reduced PGS) | "diff-cpu" | "cuda" (diff ABA)
     num_envs: int = 64
     episode_len: int = 64           # control steps per episode (time-limit truncation)
 

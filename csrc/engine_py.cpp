@@ -14,6 +14,7 @@
 //
 
 #include <cstdint>
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -30,6 +31,11 @@
 #include "engine/physics/dynamics/articulation.h"
 #include "engine/physics/diff/diff_environment.h"
 #include "engine/physics_env/vec_env.h"
+#include "engine/physics_env/diff_vec_env.h"      // CPU diff-ABA batched RL env (walk on smoothed contact)
+#include "engine/physics/diff/from_articulation.h" // articulationToDiffModel (build the render model)
+#if defined(ENGINE_CUDA)
+#include "engine/physics_env/cuda_vec_env.h"      // GPU diff-ABA batched RL env (same physics, on the A10G)
+#endif
 
 #include "obs/obs.h"   // the single C++ obs-composition source (shared with the visualizer)
 
@@ -37,6 +43,33 @@ namespace nb = nanobind;
 namespace pe = engine::physics_env;
 namespace ph = engine::physics;
 namespace pd = engine::physics::diff;
+
+// Row-major rotation matrix (M3<float>, m[row][col], maps local→world) → (w,x,y,z) quaternion.
+// Shepperd's method (numerically stable across the four cases). Used to expose diff-env link
+// orientations for rendering.
+static inline void m3ToQuatWXYZ(const pd::M3<float>& R, float* q) {
+    const float m00 = R.m[0][0], m11 = R.m[1][1], m22 = R.m[2][2];
+    const float tr = m00 + m11 + m22;
+    float w, x, y, z;
+    if (tr > 0.f) {
+        float s = std::sqrt(tr + 1.f) * 2.f;                       // s = 4w
+        w = 0.25f * s; x = (R.m[2][1] - R.m[1][2]) / s;
+        y = (R.m[0][2] - R.m[2][0]) / s; z = (R.m[1][0] - R.m[0][1]) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = std::sqrt(1.f + m00 - m11 - m22) * 2.f;          // s = 4x
+        w = (R.m[2][1] - R.m[1][2]) / s; x = 0.25f * s;
+        y = (R.m[0][1] + R.m[1][0]) / s; z = (R.m[0][2] + R.m[2][0]) / s;
+    } else if (m11 > m22) {
+        float s = std::sqrt(1.f + m11 - m00 - m22) * 2.f;          // s = 4y
+        w = (R.m[0][2] - R.m[2][0]) / s; x = (R.m[0][1] + R.m[1][0]) / s;
+        y = 0.25f * s; z = (R.m[1][2] + R.m[2][1]) / s;
+    } else {
+        float s = std::sqrt(1.f + m22 - m00 - m11) * 2.f;          // s = 4z
+        w = (R.m[1][0] - R.m[0][1]) / s; x = (R.m[0][2] + R.m[2][0]) / s;
+        y = (R.m[1][2] + R.m[2][1]) / s; z = 0.25f * s;
+    }
+    q[0] = w; q[1] = x; q[2] = y; q[3] = z;
+}
 
 // Owns a ThreadPool + VecEnv together (VecEnv borrows the pool) and derives the SoA layout offsets.
 struct PyVecEnv {
@@ -129,6 +162,128 @@ struct PyVecEnv {
     }
 };
 
+// ---- Batched differentiable RL envs (walk on the diff ABA + smoothed contact) -----------------
+// The CPU `DiffVecEnv` and — under ENGINE_CUDA — the GPU `CudaVecEnv` step the SAME templated
+// diffSubstep + shared actuation/obs (engine env_ops.h): "one physics on CPU and GPU". Flat-obs
+// surface only (walk-scoped): num_envs/act_dim/obs_dim/ndof/nbody, reset/reset_masked/step, zero-copy
+// actions()/observations(), and proprio() composed (single C++ sim1::obs source) from the flat obs.
+// No per-body world state / RSI — deferred with getup/track. Same obs layout as PyVecEnv, so the
+// Python `EngineVecEnv` slicing + tasks run unchanged.
+struct PyDiffVecEnv {
+    engine::core::ThreadPool pool;
+    pe::DiffVecEnv           env;
+    std::size_t              num_envs, act_dim, obs_dim, ndof, nbody;
+    std::vector<float>       proprio_composed_;
+    // Per-body world state for RENDERING (Option B): the diff env is flat-only for training, but we
+    // can read per-link world pose/vel from the DiffState via linkWorld() for the visualizer. This is
+    // the read side only (NOT RSI). Model rebuilt here from the same articulation the env uses.
+    pd::DiffModel            renderModel_;
+    std::vector<float>       body_pos_, body_quat_, body_linvel_, body_angvel_;
+
+    PyDiffVecEnv(std::size_t n, const pe::EnvConfig& cfg, int threads)
+        : pool(static_cast<unsigned>(threads < 0 ? 0 : threads)),   // 0 ⇒ hardware_concurrency
+          env(n, cfg, &pool),
+          num_envs(n), act_dim(env.actDim()), obs_dim(env.obsDim()),
+          renderModel_(pd::articulationToDiffModel(cfg.articulation, pd::DiffContact::All)) {
+        ndof = act_dim; nbody = obs_dim - 13 - 2 * ndof;
+        refreshBodies();
+    }
+
+    // Fill the per-body world SoA from each env's DiffState via forward kinematics (linkWorld).
+    // linkWorld returns per-link world COM pos + rotation matrix + lin/ang vel; we convert the
+    // rotation to a (w,x,y,z) quaternion. NOTE: pos is the COM (not the body origin) — parity vs the
+    // reduced backend is validated in tests; a COM→origin offset is applied there if needed.
+    void refreshBodies() {
+        const std::size_t B = nbody;
+        body_pos_.resize(num_envs * B * 3);
+        body_quat_.resize(num_envs * B * 4);
+        body_linvel_.resize(num_envs * B * 3);
+        body_angvel_.resize(num_envs * B * 3);
+        for (std::size_t i = 0; i < num_envs; ++i) {
+            const auto lw = pd::linkWorld<float>(renderModel_, env.state(i));   // [numLinks]
+            for (std::size_t k = 0; k < B && k < lw.size(); ++k) {
+                const auto& L = lw[k];
+                float* p = &body_pos_[(i * B + k) * 3];
+                p[0] = L.pos.x; p[1] = L.pos.y; p[2] = L.pos.z;
+                m3ToQuatWXYZ(L.rot, &body_quat_[(i * B + k) * 4]);
+                float* lp = &body_linvel_[(i * B + k) * 3];
+                lp[0] = L.linVel.x; lp[1] = L.linVel.y; lp[2] = L.linVel.z;
+                float* ap = &body_angvel_[(i * B + k) * 3];
+                ap[0] = L.angVel.x; ap[1] = L.angVel.y; ap[2] = L.angVel.z;
+            }
+        }
+    }
+
+    void reset(std::uint64_t seed) { env.reset(seed); refreshBodies(); }
+    void reset_masked(nb::ndarray<const std::uint8_t, nb::ndim<1>> mask, std::uint64_t seed) {
+        env.resetMasked(std::span<const std::uint8_t>(mask.data(), mask.shape(0)), seed);
+        refreshBodies();
+    }
+    void step() { env.step(); refreshBodies(); }
+};
+
+#if defined(ENGINE_CUDA)
+struct PyCudaVecEnv {
+    pe::CudaVecEnv     env;
+    std::size_t        num_envs, act_dim, obs_dim, ndof, nbody;
+    std::vector<float> proprio_composed_;
+
+    PyCudaVecEnv(std::size_t n, const pe::EnvConfig& cfg, int /*threads (GPU: one thread per env)*/)
+        : env(n, cfg),
+          num_envs(n), act_dim(env.actDim()), obs_dim(env.obsDim()) {
+        ndof = act_dim; nbody = obs_dim - 13 - 2 * ndof;
+    }
+    void reset(std::uint64_t seed) { env.reset(seed); }
+    void reset_masked(nb::ndarray<const std::uint8_t, nb::ndim<1>> mask, std::uint64_t seed) {
+        env.resetMasked(std::span<const std::uint8_t>(mask.data(), mask.shape(0)), seed);
+    }
+    void step() { env.step(); }
+};
+#endif
+
+// One registrar for the shared flat-obs surface — PyDiffVecEnv and PyCudaVecEnv have identical member
+// names (`env` exposes span-returning actions()/observations()), so we bind both from one place and
+// never diverge. Construction differs (CPU takes a thread count → pool; GPU ignores it) so the ctor
+// is bound per class by the caller.
+template <class T>
+static void bind_flat_diff_vecenv(nb::class_<T>& c) {
+    c.def_ro("num_envs", &T::num_envs)
+     .def_ro("act_dim", &T::act_dim)
+     .def_ro("obs_dim", &T::obs_dim)
+     .def_ro("ndof", &T::ndof)
+     .def_ro("nbody", &T::nbody)
+     .def("reset", &T::reset, nb::arg("seed") = 0)
+     .def("reset_masked", &T::reset_masked, nb::arg("mask"), nb::arg("seed") = 0)
+     .def("step", &T::step)
+     // zero-copy WRITABLE (N, act_dim) view into the host action mirror; `self` owns the buffer.
+     .def("actions", [](nb::object self_obj) {
+         T& v = nb::cast<T&>(self_obj);
+         std::size_t shape[2] = { v.num_envs, v.act_dim };
+         return nb::ndarray<nb::numpy, float, nb::ndim<2>>(v.env.actions().data(), 2, shape, self_obj);
+     })
+     // zero-copy READ-ONLY (N, obs_dim) view (flat layout; Python slices the named fields).
+     .def("observations", [](nb::object self_obj) {
+         T& v = nb::cast<T&>(self_obj);
+         std::size_t shape[2] = { v.num_envs, v.obs_dim };
+         return nb::ndarray<nb::numpy, const float, nb::ndim<2>>(v.env.observations().data(), 2, shape, self_obj);
+     })
+     // composed proprioception block (N, proprioDim) via the single C++ obs source (sim1::obs),
+     // built from the flat obs rows — identical to PyVecEnv::proprio (no per-body state needed).
+     .def("proprio", [](nb::object self_obj, const std::string& rotation, const std::string& frame) {
+         T& v = nb::cast<T&>(self_obj);
+         const std::size_t dim = static_cast<std::size_t>(
+             sim1::obs::proprioDim(rotation, static_cast<int>(v.ndof), static_cast<int>(v.nbody)));
+         v.proprio_composed_.clear();
+         v.proprio_composed_.reserve(v.num_envs * dim);
+         const float* obs = v.env.observations().data();
+         for (std::size_t i = 0; i < v.num_envs; ++i)
+             sim1::obs::composeProprioBlock(rotation, frame,
+                 std::span<const float>(obs + i * v.obs_dim, v.obs_dim), v.proprio_composed_);
+         std::size_t shape[2] = { v.num_envs, dim };
+         return nb::ndarray<nb::numpy, const float, nb::ndim<2>>(v.proprio_composed_.data(), 2, shape, self_obj);
+     }, nb::arg("rotation") = "quat", nb::arg("frame") = "world");
+}
+
 // ---- Differentiable environment (SHAC/tracking spike) -----------------------------------------
 // Read-only binding of engine::physics::diff::DiffEnvironment (the FD-validated differentiable twin
 // of physics_env::Environment). Exposes stepping + per-body world readback + the per-step tangent
@@ -190,6 +345,7 @@ NB_MODULE(engine_py, m) {
         .def_rw("action_mode", &ph::SimConfig::actionMode)
         .def_rw("kp", &ph::SimConfig::kp)
         .def_rw("kd", &ph::SimConfig::kd)
+        .def_rw("contact_semi_implicit", &ph::SimConfig::contactSemiImplicit)
         // gravity as an (x, y, z) tuple for convenience
         .def_prop_rw("gravity",
             [](const ph::SimConfig& c) { return std::make_tuple(c.gravity.x, c.gravity.y, c.gravity.z); },
@@ -291,6 +447,45 @@ NB_MODULE(engine_py, m) {
             return nb::ndarray<nb::numpy, const float, nb::ndim<2>>(v.body_composed_.data(), 2, shape, self_obj);
         });
 
+    // Batched diff-ABA RL envs (walk on smoothed contact) — same flat surface as VecEnv above.
+    nb::class_<PyDiffVecEnv> diff_cls(m, "DiffVecEnv");
+    diff_cls.def(nb::init<std::size_t, const pe::EnvConfig&, int>(),
+                 nb::arg("num_envs"), nb::arg("config"), nb::arg("threads") = 0);
+    bind_flat_diff_vecenv(diff_cls);
+    // Per-body world readout (rendering only; via linkWorld FK on the DiffState). CPU diff env only —
+    // the CUDA env keeps state on-device, so per-body readback there is deferred with Option A.
+    diff_cls
+        .def("body_pos", [](nb::object o) {
+            PyDiffVecEnv& v = nb::cast<PyDiffVecEnv&>(o);
+            std::size_t shape[3] = { v.num_envs, v.nbody, 3 };
+            return nb::ndarray<nb::numpy, const float, nb::ndim<3>>(v.body_pos_.data(), 3, shape, o);
+        })
+        .def("body_quat", [](nb::object o) {
+            PyDiffVecEnv& v = nb::cast<PyDiffVecEnv&>(o);
+            std::size_t shape[3] = { v.num_envs, v.nbody, 4 };
+            return nb::ndarray<nb::numpy, const float, nb::ndim<3>>(v.body_quat_.data(), 3, shape, o);
+        })
+        .def("body_linvel", [](nb::object o) {
+            PyDiffVecEnv& v = nb::cast<PyDiffVecEnv&>(o);
+            std::size_t shape[3] = { v.num_envs, v.nbody, 3 };
+            return nb::ndarray<nb::numpy, const float, nb::ndim<3>>(v.body_linvel_.data(), 3, shape, o);
+        })
+        .def("body_angvel", [](nb::object o) {
+            PyDiffVecEnv& v = nb::cast<PyDiffVecEnv&>(o);
+            std::size_t shape[3] = { v.num_envs, v.nbody, 3 };
+            return nb::ndarray<nb::numpy, const float, nb::ndim<3>>(v.body_angvel_.data(), 3, shape, o);
+        });
+
+#if defined(ENGINE_CUDA)
+    nb::class_<PyCudaVecEnv> cuda_cls(m, "CudaVecEnv");
+    cuda_cls.def(nb::init<std::size_t, const pe::EnvConfig&, int>(),
+                 nb::arg("num_envs"), nb::arg("config"), nb::arg("threads") = 0);
+    bind_flat_diff_vecenv(cuda_cls);
+    m.attr("HAS_CUDA") = true;
+#else
+    m.attr("HAS_CUDA") = false;
+#endif
+
     // Differentiable environment (read-only spike surface).
     nb::class_<PyDiffEnv>(m, "DiffEnv")
         .def(nb::init<const std::string&, const std::string&, double, int>(),
@@ -306,8 +501,8 @@ NB_MODULE(engine_py, m) {
         // joint velocity qd (ndofJoints,) — a readable observable for FD gradient checks.
         .def("qd", [](nb::object self_obj) {
             PyDiffEnv& v = nb::cast<PyDiffEnv&>(self_obj);
-            const auto& qd = v.env.state().qd;
-            v.qd_.assign(qd.begin(), qd.end());
+            const auto& st = v.env.state();
+            v.qd_.assign(st.qd, st.qd + st.numDof);   // DiffState::qd is S[kMaxDof]; numDof are valid
             std::size_t shape[1] = { v.qd_.size() };
             return nb::ndarray<nb::numpy, const double, nb::ndim<1>>(v.qd_.data(), 1, shape, self_obj);
         })

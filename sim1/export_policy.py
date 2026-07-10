@@ -10,7 +10,7 @@ Usage:
 
 File format (SIM1_POLICY_V8) — a sequence of `label value` tokens then arrays, read positionally:
     SIM1_POLICY_V8
-    model <str> backend <str> action_mode <str>
+    model <str> backend <str> action_mode <str>   # backend: reduced|realtime (kind=engine) | diff-cpu|cuda
     substeps <int> control_dt <float> kp <float> kd <float> max_torque <float> ground_friction <float>
     episode_len <int> fall_height_frac <float> upright_fall <float>
     ndof <int> nbody <int> obs_dim <int> act_dim <int> action_scale <float> norm_eps <float>
@@ -53,6 +53,12 @@ def export(run: str, checkpoint: str = "best.pt", out: str | None = None) -> Pat
     run_dir = Path(run)
     cfg = json.loads((run_dir / "config.json").read_text())
     env, task = cfg["env"], cfg["task"]
+
+    # Truthful backend label. `env.backend` (reduced/realtime) only describes the PhysicsWorld solver
+    # used by kind='engine'; diff/cuda runs train on the diff-ABA backend, so record the kind there
+    # (else diff policies mislabel themselves as 'reduced' and the visualizer picks the wrong physics).
+    kind = env.get("kind", "engine")
+    backend_tag = kind if kind in ("diff-cpu", "cuda") else env.get("backend", "reduced")
 
     ckpt_path = run_dir / "checkpoints" / checkpoint
     if not ckpt_path.exists():
@@ -100,7 +106,7 @@ def export(run: str, checkpoint: str = "best.pt", out: str | None = None) -> Pat
 
     lines = [
         "SIM1_POLICY_V8",
-        f"model {env['model']} backend {env.get('backend', 'reduced')} action_mode {env['action_mode']}",
+        f"model {env['model']} backend {backend_tag} action_mode {env['action_mode']}",
         f"substeps {env['substeps']} control_dt {env['control_dt']:.10g} kp {env['kp']:.10g} "
         f"kd {env['kd']:.10g} max_torque {env['max_torque']:.10g} "
         f"ground_friction {env.get('ground_friction', 0.9):.10g}",
